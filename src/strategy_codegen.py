@@ -574,3 +574,57 @@ OTHER LEARNINGS:
 {_OUTPUT_FORMAT.format(example=example)}
 Write exactly {total} blocks ({variants_per_parent} per parent), each with a NEW unique snake_case name and a `parent:` line.
 """
+
+
+# --------------------------------------------------------------------------
+# Descriptive file name: strat_gen_<family>_<indicators>_<side>_<exits>_v<n>.py
+# --------------------------------------------------------------------------
+
+_INDICATOR_TAGS = {"sma": "sma", "ema": "ema", "rsi": "rsi", "atr": "atr", "adx": "adx", "macd": "macd", "stoch": "stoch",
+                   "zscore": "zscore", "roc": "roc", "stdev": "std", "hh": "channel", "ll": "channel", "clv": "clv",
+                   "pct_rank": "rank", "eff_ratio": "er", "up_streak": "streak", "down_streak": "streak"}
+_ASSIGN_RE = re.compile(r"^\s*((?:[\w, ]+(?<![=!<>])=(?!=))+)(.*)$")
+_FALSE_RHS_RE = re.compile(r"^\s*(?:pd\.Series\(False.*|False)\s*$")
+
+
+def _assigns(body: str, var: str) -> bool:
+    """True if the body gives `var` a real (non-constant-False) value."""
+    for line in body.splitlines():
+        m = _ASSIGN_RE.match(line.split("#")[0])
+        if not m or var not in re.findall(r"\w+", m.group(1)):
+            continue
+        if not _FALSE_RHS_RE.match(m.group(2)) and not re.search(rf"\b{var}\b", m.group(2)):
+            return True
+    return False
+
+
+def strategy_filename(name: str, family: str, params: dict, body: str, sl: float | None = None,
+                      tp: float | None = None) -> str:
+    """Descriptive file name built from what the strategy does (family, the
+    indicators its code calls, long/short, exits) instead of its lineage name,
+    e.g. strat_gen_trend_ema_adx_ls_trail_v3.py. The trailing vN is the mutation
+    depth (number of _vN/_gN/_varN steps in the lineage name)."""
+    body = body.split("\n", 1)[1] if body.lstrip().startswith("def _body(") else body
+    found: list[tuple[int, str]] = []
+    for helper, tag in _INDICATOR_TAGS.items():
+        m = re.search(rf"(?<![\w.]){helper}\s*\(", body)
+        if m:
+            found.append((m.start(), tag))
+    for pat, tag in ((r"\.rolling\([^)]*\)\.mean\(", "sma"), (r"\.ewm\(\s*span", "ema")):
+        m = re.search(pat, body)
+        if m:
+            found.append((m.start(), tag))
+    inds: list[str] = []
+    for _, tag in sorted(found):
+        if tag not in inds:
+            inds.append(tag)
+    cal = [t for pat, t in ((r"\.day\b", "dom"), (r"\.month\b", "month"), (r"dayofweek|weekday", "dow")) if re.search(pat, body)]
+    long_, short_ = _assigns(body, "le"), _assigns(body, "se")
+    side = "ls" if long_ and short_ else "short" if short_ else "long"
+    keys = " ".join(params).lower() + " " + name.lower()
+    exits = [t for cond, t in (("trail" in keys or "trail" in body, "trail"),
+                               (re.search(r"time|hold|bars_exit", keys), "timeexit")) if cond]
+    depth = len(re.findall(r"(?:^|_)(?:v|g|var)\d+(?=_|$)", name.lower())) or 1
+    fam = re.sub(r"[^a-z0-9]", "", family.lower())
+    tokens = ([fam] if fam not in ("", "other") else []) + cal + inds[:4] + [side] + exits + [f"v{depth}"]
+    return "strat_gen_" + "_".join(tokens) + ".py"
