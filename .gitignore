@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Outputs and logs
+results/
+logs/
+*.log
+
+# Market data
+data/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editor / OS / tooling
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db

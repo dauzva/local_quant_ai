@@ -1,0 +1,253 @@
+run:
+  name: local_quant_run
+  # 0 = run until max_minutes / LLM quota / budget is exhausted (auto mode).
+  iterations: 10
+  max_minutes: null
+  # Each iteration fires these LLM requests concurrently. EXPLORE = fresh
+  # theme-seeded strategies in bulk; EVOLVE = send the best strategies found so
+  # far back to the LLM with their per-asset-class results + diagnosis.
+  # Strategies per iteration ~= explore * strategies_per_call
+  #                           + evolve * parents_per_call * variants_per_parent.
+  explore_calls_per_iteration: 4
+  evolve_calls_per_iteration: 2
+  # ---- zero-token learning (src/tuner.py + src/mutation.py) ----
+  # After each iteration, the best strategies (this iteration's + leaderboard) are
+  # evolved locally for `tune_seconds`: each step evaluates `tune_candidates`
+  # mutated variants (parameters, stop/target, drop/invert a leg, trend/vol/ADX
+  # filters, time stop...) on the whole universe in parallel and promotes the best
+  # one if it beats its parent by `tune_min_gain`. Operator choice follows the
+  # diagnosis of the parent and each operator's measured success rate.
+  tune_seconds: 60
+  tune_top_k: 6
+  tune_candidates: 16
+  tune_patience: 2
+  tune_min_gain: 0.005
+  tune_workers: 16
+  # Classic strategy templates with random parameters: free candidates every
+  # iteration (x3 when running offline) so the local search always has parents.
+  seed_samples_per_iteration: 10
+  # If the LLM quota/key dies, keep going with seeds + local search.
+  offline_fallback: true
+  # At the end of a run the top N strategies by score are written to
+  # results/<run_id>/strategies/ (accepted or not).
+  save_top_n: 10
+  random_seed: 42
+
+data:
+  format: tradestation_binary
+  directory: ./data
+  filename_pattern: "^A_OHLCV_(?P<symbol>.+)_minutes_(?P<minutes>\\d+)\\.dat$"
+  file_map:
+    "@AD": "A_OHLCV_@AD_minutes_1440.dat"
+    "@BO": "A_OHLCV_@BO_minutes_1440.dat"
+    "@BP": "A_OHLCV_@BP_minutes_1440.dat"
+    "@BR=13INC": "A_OHLCV_@BR=13INC_minutes_1440.dat"
+    "@BRN=103XC": "A_OHLCV_@BRN=103XC_minutes_1440.dat"
+    "@BRN=107XC": "A_OHLCV_@BRN=107XC_minutes_1440.dat"
+    "@BTC": "A_OHLCV_@BTC_minutes_1440.dat"
+    "@C": "A_OHLCV_@C_minutes_1440.dat"
+    "@CC": "A_OHLCV_@CC_minutes_1440.dat"
+    "@CC3=13INC": "A_OHLCV_@CC3=13INC_minutes_1440.dat"
+    "@CD": "A_OHLCV_@CD_minutes_1440.dat"
+    "@CL": "A_OHLCV_@CL_minutes_1440.dat"
+    "@CT": "A_OHLCV_@CT_minutes_1440.dat"
+    "@DA=13INC": "A_OHLCV_@DA=13INC_minutes_1440.dat"
+    "@DX": "A_OHLCV_@DX_minutes_1440.dat"
+    "@EC": "A_OHLCV_@EC_minutes_1440.dat"
+    "@EMD": "A_OHLCV_@EMD_minutes_1440.dat"
+    "@ES": "A_OHLCV_@ES_minutes_1440.dat"
+    "@FC": "A_OHLCV_@FC_minutes_1440.dat"
+    "@FDAX": "A_OHLCV_@FDAX_minutes_1440.dat"
+    "@FESX": "A_OHLCV_@FESX_minutes_1440.dat"
+    "@FGBL": "A_OHLCV_@FGBL_minutes_1440.dat"
+    "@FGBM": "A_OHLCV_@FGBM_minutes_1440.dat"
+    "@FGBS": "A_OHLCV_@FGBS_minutes_1440.dat"
+    "@FGBX=103XC": "A_OHLCV_@FGBX=103XC_minutes_1440.dat"
+    "@FGBX=105XC": "A_OHLCV_@FGBX=105XC_minutes_1440.dat"
+    "@FV": "A_OHLCV_@FV_minutes_1440.dat"
+    "@GC": "A_OHLCV_@GC_minutes_1440.dat"
+    "@HG": "A_OHLCV_@HG_minutes_1440.dat"
+    "@HO": "A_OHLCV_@HO_minutes_1440.dat"
+    "@JY": "A_OHLCV_@JY_minutes_1440.dat"
+    "@KC": "A_OHLCV_@KC_minutes_1440.dat"
+    "@KW": "A_OHLCV_@KW_minutes_1440.dat"
+    "@LC": "A_OHLCV_@LC_minutes_1440.dat"
+    "@LH": "A_OHLCV_@LH_minutes_1440.dat"
+    "@LJ=117XC": "A_OHLCV_@LJ=117XC_minutes_1440.dat"
+    "@LJ=124XC": "A_OHLCV_@LJ=124XC_minutes_1440.dat"
+    "@LT2=103XC": "A_OHLCV_@LT2=103XC_minutes_1440.dat"
+    "@LZ=103XC": "A_OHLCV_@LZ=103XC_minutes_1440.dat"
+    "@LZ=104XC": "A_OHLCV_@LZ=104XC_minutes_1440.dat"
+    "@MFS=103XC": "A_OHLCV_@MFS=103XC_minutes_1440.dat"
+    "@MME=103XC": "A_OHLCV_@MME=103XC_minutes_1440.dat"
+    "@MP1": "A_OHLCV_@MP1_minutes_1440.dat"
+    "@NE1": "A_OHLCV_@NE1_minutes_1440.dat"
+    "@NG": "A_OHLCV_@NG_minutes_1440.dat"
+    "@NK": "A_OHLCV_@NK_minutes_1440.dat"
+    "@NQ": "A_OHLCV_@NQ_minutes_1440.dat"
+    "@O": "A_OHLCV_@O_minutes_1440.dat"
+    "@OJ": "A_OHLCV_@OJ_minutes_1440.dat"
+    "@PA=105NC": "A_OHLCV_@PA=105NC_minutes_1440.dat"
+    "@PL": "A_OHLCV_@PL_minutes_1440.dat"
+    "@RB": "A_OHLCV_@RB_minutes_1440.dat"
+    "@RC=13VOC": "A_OHLCV_@RC=13VOC_minutes_1440.dat"
+    "@RP=13INC": "A_OHLCV_@RP=13INC_minutes_1440.dat"
+    "@RR": "A_OHLCV_@RR_minutes_1440.dat"
+    "@RTY": "A_OHLCV_@RTY_minutes_1440.dat"
+    "@S": "A_OHLCV_@S_minutes_1440.dat"
+    "@SB": "A_OHLCV_@SB_minutes_1440.dat"
+    "@SF": "A_OHLCV_@SF_minutes_1440.dat"
+    "@SI": "A_OHLCV_@SI_minutes_1440.dat"
+    "@SM": "A_OHLCV_@SM_minutes_1440.dat"
+    "@TEN=117XC": "A_OHLCV_@TEN=117XC_minutes_1440.dat"
+    "@TU": "A_OHLCV_@TU_minutes_1440.dat"
+    "@TY": "A_OHLCV_@TY_minutes_1440.dat"
+    "@UB=117XC": "A_OHLCV_@UB=117XC_minutes_1440.dat"
+    "@UB=120XC": "A_OHLCV_@UB=120XC_minutes_1440.dat"
+    "@ULS=103XC": "A_OHLCV_@ULS=103XC_minutes_1440.dat"
+    "@ULS=116XC": "A_OHLCV_@ULS=116XC_minutes_1440.dat"
+    "@US": "A_OHLCV_@US_minutes_1440.dat"
+    "@VX": "A_OHLCV_@VX_minutes_1440.dat"
+    "@W": "A_OHLCV_@W_minutes_1440.dat"
+    "@WBS=103XC": "A_OHLCV_@WBS=103XC_minutes_1440.dat"
+    "@WBS=107XC": "A_OHLCV_@WBS=107XC_minutes_1440.dat"
+    "@YM": "A_OHLCV_@YM_minutes_1440.dat"
+    
+  default_symbol: "@TY"
+  expected_minutes: 1440
+  allow_other_minutes: false
+  timezone: UTC
+  timeframe: 1d
+  periods_per_year: 252
+  use_file_metadata_symbol: true
+  use_file_metadata_timezone: false
+  drop_zero_volume: false
+  drop_bad_rows: false
+  symbol_priority: [filename, binary_metadata, config]
+
+universe:
+  # Every strategy is evaluated on every symbol here (see src/universe.py).
+  symbols: all
+  # Near-duplicate contract variants of the same market (they would count the
+  # same bet 2-3x in the score).
+  exclude: ["@FGBX=105XC", "@LJ=124XC", "@LZ=104XC", "@UB=120XC"]
+  min_bars: 2500
+  # Data-quality filters: percent-based logic is meaningless on back-adjusted
+  # series that go negative (cocoa, heating oil, RBOB, soy meal, gasoil...).
+  max_nonpositive_frac: 0.0005
+  max_big_move_frac: 0.003
+  max_symbols: null
+  # Quick pre-screen: evaluate this many group-diverse symbols first and stop
+  # if the strategy is clearly bad there (saves most of the backtest time).
+  probe_symbols: 12
+  probe_min_median_sharpe: -0.05
+  probe_min_pct_positive: 0.45
+  # Probe symbols trading less than this fraction of min_trades_per_year are rejected early.
+  probe_min_tpy_fraction: 0.4
+  max_eval_seconds: 90
+  # A strategy is ACCEPTED (saved + holdout-checked) when, over the symbols:
+  accept:
+    min_pass_rate: 0.08      # share of symbols clearing every walk-forward criterion in `validation`
+    min_pct_positive: 0.60   # share of symbols with positive average fold Sharpe
+    min_score: 0.15          # frequency-adjusted mean (clipped) per-symbol average fold Sharpe
+    min_trades_per_year: 10  # mean trades/yr per symbol; below this the score is scaled down by tpy/10
+    fitness_pass_weight: 0.4 # searches maximise fitness = score + weight * (share of symbols passing every criterion)
+
+instruments:
+  "@TY":
+    exchange: CME
+    description: 10-Year Treasury Note Futures
+    currency: USD
+    point_value: 1000.0
+    tick_size: 0.015625
+    continuous_contract: true
+    roll_adjustment: none
+
+backtest:
+  initial_capital: 100000
+  # Per-symbol capital = max(initial_capital, capital_per_notional * median
+  # 1-contract notional): keeps sizing/drawdown comparable between a $20k
+  # grain contract and a $350k index contract. 0 = always initial_capital.
+  capital_per_notional: 2.0
+  cost_model: futures
+  fee_bps: 0
+  slippage_bps: 0
+  commission_per_side_usd: 2.0
+  slippage_ticks: 1
+  execution: next_bar_open
+  allow_short: true
+  stop_loss_pct_default: 0.02
+  take_profit_pct_default: 0.04
+  position_sizing: risk_based_contracts
+  risk_per_trade: 0.01
+  default_contracts: 1
+  max_contracts: 5
+  allow_fractional_contracts: false
+
+validation:
+  num_folds: 6
+  # Frequency is part of validity: a "strategy" firing 2-5 times a year is a
+  # handful of lucky positions. Every fold must hold at least
+  # max(min_trades_per_fold, min_trades_per_year * fold_years) trades
+  # (10/yr over ~4-year folds = 40+ per fold, hundreds per symbol overall).
+  min_trades_per_fold: 10
+  min_trades_per_year: 10
+  min_avg_fold_sharpe: 0.3
+  min_fold_sharpe_floor: -0.2
+  min_sharpe_consistency: 0.3
+  max_fold_drawdown: 0.35
+  min_avg_profit_factor: 1.0
+
+llm:
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  # Tried in order (then auto-discovered free models). The client re-orders
+  # them on the fly: rate-limited models cool down, flaky ones are demoted.
+  models:
+    - poolside/laguna-s-2.1:free
+    - nvidia/nemotron-3-super-120b-a12b:free
+  use_only_free_models: true
+  allow_paid_fallback: false
+  # Reasoning-style models spend the output budget on hidden thinking (100-290s
+  # calls, 0-1 usable strategies out of 10 in real runs). Skipped unless nothing
+  # else is available. Substring match on the model id.
+  avoid_models: ["-r1", "thinking", "reasoning"]
+  # Free accounts get ~50 requests/DAY account-wide (1000 with $10 credit), so
+  # the number of strategies per REQUEST is what matters: 10-12 per call
+  # => ~500-600 strategies/day on the free tier. For unlimited volume use a
+  # cheap paid model (set use_only_free_models: false and list it first);
+  # one iteration then costs a few cents.
+  strategies_per_call: 10
+  parents_per_call: 2
+  variants_per_parent: 3
+  concurrency: 3
+  tokens_per_strategy: 330
+  max_tokens: 6000
+  explore_temperature: 0.9
+  evolve_temperature: 0.6
+  temperature: 0.7
+  reasoning_effort: low
+  # Stop the run once total LLM spend reaches this many USD. null = no cap.
+  max_cost_usd: null
+  auto_discover_free_models: true
+  max_free_models: 20
+  max_retries: 2
+  timeout_seconds: 120
+  retry_wait_seconds: 3
+  # A 429'd model is skipped for this long instead of being re-hit each call.
+  rate_limit_cooldown_seconds: 60
+  max_cooldown_wait_seconds: 90
+  request_headers:
+    HTTP-Referer: https://localhost/local-quant-ai
+    X-Title: local_quant_ai
+
+memory:
+  # Cross-run learning store (see src/memory.py): survives across separate
+  # `python main.py run` invocations, so each run continues where the last
+  # one left off instead of starting blind.
+  path: results/memory/state.json
+
+logging:
+  level: INFO
+  file: logs/local_quant_ai.log
