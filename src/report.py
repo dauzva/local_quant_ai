@@ -197,7 +197,7 @@ def write_markdown_report(strategy, symbol: str, source_filename: str, timeframe
         f"- Take profit: {strategy.take_profit_pct}",
         f"- Position sizing: {strategy.position_sizing}, risk_per_trade={strategy.risk_per_trade}",
         "",
-        "## Strategy source (see also strategy.py alongside this report)",
+        "## Strategy source (see also strat_gen_*.py alongside this report)",
         "```python",
         strategy.source,
         "```",
@@ -313,7 +313,7 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, holdout: dict
         "## Parameters",
         f"`{spec.params}` | stop {compiled.stop_loss_pct} | target {compiled.take_profit_pct}",
         "",
-        "See `per_symbol.csv` / `per_symbol.png` for the breakdown and `strategy.py` for the standalone code.",
+        "See `per_symbol.csv` / `per_symbol.png` for the breakdown and `strat_gen_*.py` for the standalone code.",
         "",
         "_Research only; not financial advice._",
     ]

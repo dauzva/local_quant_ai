@@ -126,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tune.set_defaults(func=cmd_tune)
 
     p_bt = sub.add_parser("backtest-strategy", help="Run one saved strategy .py file across the universe")
-    p_bt.add_argument("--file", type=str, required=True, help="Path to a strategy .py file (e.g. results/<run_id>/strategies/<name>/strategy.py)")
+    p_bt.add_argument("--file", type=str, required=True, help="Path to a strategy .py file (e.g. results/<run_id>/strategies/<name>/strat_gen_<name>.py)")
     p_bt.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (default: whole universe)")
     p_bt.set_defaults(func=cmd_backtest_strategy)
 

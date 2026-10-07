@@ -238,8 +238,8 @@ def test_full_loop_with_fake_llm(cfg, tmp_path, monkeypatch):
     state = memory.load_memory(cfg.memory.path)
     assert state["total_tried"] > 5 and state["leaderboard"]
     accepted = next((run_dir / "strategies").iterdir())
-    assert (accepted / "strategy.py").exists() and (accepted / "per_symbol.csv").exists()
-    compile_strategy((accepted / "strategy.py").read_text(encoding="utf-8"))   # saved file is a valid standalone strategy
+    assert (next(accepted.glob("strat_gen_*.py"))).exists() and (accepted / "per_symbol.csv").exists()
+    compile_strategy((next(accepted.glob("strat_gen_*.py"))).read_text(encoding="utf-8"))   # saved file is a valid standalone strategy
     assert (tmp_path / "memory" / "experiments.jsonl").exists()
 
 
@@ -356,7 +356,7 @@ def test_offline_tune_runs_without_llm_and_saves_top_strategies(cfg, tmp_path, m
     top = pd.read_csv(run_dir / "top_strategies.csv")
     assert 1 <= len(top) <= 3
     for name in top["name"]:
-        assert (run_dir / "strategies" / name / "strategy.py").exists()
+        assert (run_dir / "strategies" / name / f"strat_gen_{name}.py").exists()
         assert (run_dir / "strategies" / name / "report.md").exists()
     state = memory.load_memory(cfg.memory.path)
     assert state["total_tried"] > 5 and state["mutation_stats"]       # the search ran and recorded operator outcomes

@@ -40,7 +40,7 @@ from src.strategy_codegen import (StrategySpec, build_evolve_prompt, build_explo
 from src.strategy_sandbox import CompiledStrategy, StrategySandboxError, compile_strategy
 from src.universe import (SymbolData, UniverseResult, behavior_signature, build_eval_settings, evaluate_universe,
                           load_universe, pick_probe, run_universe_holdout)
-from src.utils import get_logger, new_run_id, safe_strategy_dirname
+from src.utils import get_logger, new_run_id, safe_strategy_dirname, strategy_filename
 
 logger = get_logger("orchestrator")
 
@@ -321,12 +321,12 @@ class Run:
 
     def _save_strategy(self, compiled: CompiledStrategy, spec: StrategySpec, result: UniverseResult,
                        holdout: dict, model: str, accepted: bool) -> Path:
-        """Write strategy.py + metadata + per-symbol table/chart + report under
+        """Write strat_gen_<name>.py + metadata + per-symbol table/chart + report under
         strategies/<name>/. Used for accepted strategies and for the end-of-run
         top-N (accepted=False)."""
         strat_dir = self.dir / "strategies" / safe_strategy_dirname(spec.name)
         strat_dir.mkdir(parents=True, exist_ok=True)
-        (strat_dir / "strategy.py").write_text(compiled.source, encoding="utf-8")
+        (strat_dir / strategy_filename(spec.name)).write_text(compiled.source, encoding="utf-8")
         metadata = {
             "strategy_name": spec.name, "class_name": compiled.class_name, "family": spec.family, "idea": spec.idea,
             "parent": spec.parent, "mutation": spec.mutation, "accepted": accepted, "params": spec.params,
@@ -520,7 +520,7 @@ def _finish(run: Run) -> None:
     run.client.usage.save(run.dir / "llm_usage.json")
     usage = run.client.usage.summary()
     evaluated = [r for r in run.rows if r.get("score") is not None]
-    # Display AND generate the top strategies: strategy.py + report + per-symbol table for each.
+    # Display AND generate the top strategies: strat_gen_<name>.py + report + per-symbol table for each.
     top = run.save_top(int(run.cfg.run.get("save_top_n", 10)))
     if top:
         pd.DataFrame(top).to_csv(run.dir / "top_strategies.csv", index=False)
@@ -541,7 +541,7 @@ def _finish(run: Run) -> None:
                     r.get("trades_per_symbol"), r.get("n_pass"), len(run.universe),
                     "ACCEPTED" if r["accepted"] else "not accepted")
     if top:
-        logger.info("Generated %d strategies (strategy.py + report.md + per_symbol.csv/png) in %s", len(top), run.dir / "strategies")
+        logger.info("Generated %d strategies (strat_gen_<name>.py + report.md + per_symbol.csv/png) in %s", len(top), run.dir / "strategies")
 
 
 def backtest_single_strategy_file(strategy_path: str, cfg, symbols: list[str] | None = None) -> None:

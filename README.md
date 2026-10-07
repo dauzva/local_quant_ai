@@ -38,7 +38,7 @@ python main.py run --symbols "@TY,@ES,@GC"       # restrict the universe
 python main.py tune --minutes 30                 # offline local search, no LLM
 
 # Re-run one saved strategy across the universe
-python main.py backtest-strategy --file results/<run_id>/strategies/<name>/strategy.py
+python main.py backtest-strategy --file results/<run_id>/strategies/<name>/strat_gen_<name>.py
 
 python -m pytest tests -q                        # offline tests, no API key needed
 ```
@@ -59,7 +59,7 @@ python -m pytest tests -q                        # offline tests, no API key nee
    the mean per-symbol fold Sharpe, scaled down for low trade frequency.
 5. **Accept**: strategies that clear `universe.accept` (breadth across markets,
    not one lucky chart) get a one-shot holdout evaluation, which is never fed
-   back, and are saved with `strategy.py`, `report.md`, `per_symbol.csv/png`
+   back, and are saved as `strat_gen_<name>.py`, `report.md`, `per_symbol.csv/png`
    and `metadata.json`.
 6. **Remember**: `results/memory/` stores the leaderboard, fingerprints,
    per-family hit rates and common errors. State is checkpointed after every
