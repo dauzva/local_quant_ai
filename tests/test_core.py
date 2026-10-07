@@ -356,7 +356,7 @@ def test_offline_tune_runs_without_llm_and_saves_top_strategies(cfg, tmp_path, m
     top = pd.read_csv(run_dir / "top_strategies.csv")
     assert 1 <= len(top) <= 3
     for name in top["name"]:
-        assert any((run_dir / "strategies" / name).glob("strat_gen_*.py"))
+        assert (run_dir / "strategies" / name / f"strat_gen_{name}.py").exists()
         assert (run_dir / "strategies" / name / "report.md").exists()
     state = memory.load_memory(cfg.memory.path)
     assert state["total_tried"] > 5 and state["mutation_stats"]       # the search ran and recorded operator outcomes

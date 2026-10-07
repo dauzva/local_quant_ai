@@ -54,6 +54,11 @@ def safe_strategy_dirname(strategy_name: str) -> str:
     return cleaned or "strategy"
 
 
+def strategy_filename(strategy_name: str) -> str:
+    """File name for a saved strategy: strat_gen_<strategy_name>.py"""
+    return f"strat_gen_{safe_strategy_dirname(strategy_name)}.py"
+
+
 def ensure_dir(path: str | Path) -> Path:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
