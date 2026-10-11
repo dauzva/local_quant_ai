@@ -30,7 +30,16 @@ run:
   offline_fallback: true
   # At the end of a run the top N strategies by score are written to
   # results/<run_id>/strategies/ (accepted or not).
+  # Strategies shown in full (code, report, per-symbol table/chart) in results/<run_id>/strategies/
+  # and, with `pipeline`, tested once on OSS2. Picked by OSS1 Sharpe from the best IS candidates.
   save_top_n: 10
+  # One iteration = one GENERATION: generate -> tune on IS -> validate on OSS1 -> next generation.
+  # After tuning, the best `validate_top_k` not-yet-validated leaderboard strategies are run on OSS1.
+  # The result re-ranks the leaderboard, so the next generation's parents (local tuner AND LLM
+  # evolve requests) are the ones that held up out of sample, and the LLM is shown how its
+  # parents did on the validation period. 0 = no validation phase (IS-accepted strategies are
+  # still validated for the acceptance gate).
+  validate_top_k: 12
   random_seed: 42
 
 data:
@@ -153,9 +162,9 @@ universe:
     min_trades_per_year: 10  # mean trades/yr per symbol; below this the score is scaled down by tpy/10
     fitness_pass_weight: 0.4 # searches maximise fitness = score + weight * (share of symbols passing every criterion)
     # Second gate = the VALIDATION set (OSS1). A strategy that clears the IS gate above is
-    # then run once on OSS1 and is ACCEPTED only if it also holds up there. OSS1 numbers are
-    # never fed to the LLM or the local search (they search on IS only); they are for model
-    # selection: accepting, ranking the end-of-run top N, and your own judgement.
+    # then run once on OSS1 and is ACCEPTED only if it also holds up there. The local tuner
+    # still maximises IS fitness only; OSS1 drives SELECTION (which strategies become parents,
+    # what the LLM is told about them, the end-of-run top N) -- model selection, as in ML.
     oss1:
       min_pct_positive: 0.55  # share of symbols with positive Sharpe on OSS1
       min_mean_sharpe: 0.10   # mean (clipped to +-1.5) per-symbol Sharpe on OSS1
@@ -192,10 +201,11 @@ backtest:
   allow_fractional_contracts: false
 
 # Dataset split, treated like a machine-learning problem (see ASSUMPTIONS.md #31):
-#   IS   (train)      the search optimises on this: LLM + local tuner + walk-forward gate.
-#   OSS1 (validation) consulted for every strategy that passes the IS gate; picks the winners.
-#   OSS2 (test)       NEVER touched by `run` / `tune`. Only `python main.py final-test`
-#                     reads it, at the very end, and every peek is logged.
+#   IS   (train)      the search optimises on this: local tuner fitness + walk-forward gate.
+#   OSS1 (validation) every generation the best strategies are validated here; the result
+#                     selects parents, informs the LLM and picks the winners.
+#   OSS2 (test)       NEVER touched by `run` / `tune`. Read once, at the very end, by
+#                     `python main.py pipeline` (or `final-test`); every look is logged.
 # The cutoffs are calendar dates shared by ALL symbols (a per-symbol percentage would put
 # one market's test period inside another market's training period, and the markets are
 # correlated). Fixed dates also mean the boundary cannot drift when the universe changes.

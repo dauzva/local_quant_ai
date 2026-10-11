@@ -38,12 +38,32 @@ def results_line(s: dict) -> str:
             f"best symbols: {best}").replace("%%", "%")
 
 
-def diagnose(s: dict, min_tpy: float = 10.0) -> str:
+def validation_line(oss1: dict | None, s: dict) -> str:
+    """One line about the strategy's result on the unseen validation period (OSS1), or ''."""
+    if not oss1 or "mean_sharpe" not in oss1:
+        return ""
+    m, pos, ins = float(oss1["mean_sharpe"]), float(oss1.get("pct_positive", 0.0)), float(s.get("score", 0.0))
+    verdict = "FAILS" if (m <= 0 or pos < 0.5) else ("degrades" if m < 0.5 * ins else "holds up")
+    return (f" | VALIDATION on a later, unseen period: mean Sharpe {m:+.2f} (in-sample score {ins:+.2f}), "
+            f"{pos:.0%} of symbols profitable -> {verdict}")
+
+
+def diagnose(s: dict, min_tpy: float = 10.0, oss1: dict | None = None) -> str:
     """Rule-based weaknesses, most important first. Always returns something.
-    `min_tpy` is the required trades per year per symbol."""
+    `min_tpy` is the required trades per year per symbol; `oss1` is the optional
+    validation-period result."""
     if not s or not s.get("n_eval"):
         return "Could not be evaluated; simplify the logic."
     hints: list[str] = []
+    if oss1 and "mean_sharpe" in oss1:
+        m, pos = float(oss1["mean_sharpe"]), float(oss1.get("pct_positive", 0.0))
+        if m <= 0 or pos < 0.5:
+            hints.append(f"OVERFIT: it fails on the unseen validation period (mean Sharpe {m:+.2f}, {pos:.0%} of symbols profitable) "
+                         "-> fewer parameters, rounder thresholds, longer lookbacks, a regime filter that is not tuned to one era; "
+                         "do NOT make it more complicated")
+        elif m < 0.5 * float(s.get("score", 0.0)):
+            hints.append(f"edge shrinks out of sample (validation Sharpe {m:+.2f} vs in-sample {s.get('score', 0.0):+.2f}) "
+                         "-> simplify, avoid thresholds tuned to a narrow range")
     n = s["n_eval"]
     fails = s.get("fail_counts", {})
     gm = s.get("group_mean_sharpe", {})

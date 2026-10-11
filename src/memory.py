@@ -17,9 +17,11 @@ state.json:
 - `recent_names`: names already used (the prompt asks the model to avoid
   repeats; the orchestrator also forces unique names).
 
-Scores in here are IS (training-segment) scores. The OSS1 (validation) results are
-stored on leaderboard entries for YOUR reading but are never included in anything
-sent to the LLM. OSS2 (test) results never enter the memory at all.
+`score` / `fitness` in here are IS (training-segment) numbers; the local tuner compares
+only those. Each leaderboard entry may also carry an `oss1` (validation) result, which
+drives SELECTION: `select_value` ranks the leaderboard and picks the parents for the next
+generation, and the evolve prompt shows the LLM how its parent did on the unseen
+validation period. OSS2 (test) results never enter the memory at all.
 """
 from __future__ import annotations
 
@@ -221,7 +223,7 @@ def record_result(state: dict, *, spec: dict, summary: dict, run_id: str, iterat
     if summary.get("score", -9) > 0 and not summary.get("probe_rejected"):
         board = state.setdefault("leaderboard", [])
         board.append(entry)
-        board.sort(key=lambda e: -rank_value(e))
+        board.sort(key=lambda e: -select_value(e))
         del board[LEADERBOARD_SIZE:]
 
 
@@ -281,6 +283,39 @@ def rank_value(e: dict) -> float:
     return e.get("fitness", e.get("score", 0.0))
 
 
+def select_value(e: dict) -> float:
+    """What SELECTION ranks by (leaderboard order, parents, prompt examples): the IS fitness
+    until the strategy has been validated, then the average of IS fitness and its OSS1 score
+    (OSS1 mean Sharpe, scaled down by the same trade-frequency factor as the IS score). A
+    strategy that is great in-sample but dies on the validation period therefore sinks."""
+    fit = rank_value(e)
+    o = e.get("oss1")
+    if not o or "mean_sharpe" not in o:
+        return fit
+    v = float(o["mean_sharpe"])
+    if v > 0:
+        v *= float(e.get("summary", {}).get("freq_factor", 1.0))
+    return 0.5 * fit + 0.5 * v
+
+
+def attach_oss1(state: dict, name: str, oss1: dict) -> bool:
+    """Record a validation result on an existing leaderboard entry and re-sort. False if
+    the strategy is not (or no longer) on the leaderboard."""
+    board = state.get("leaderboard", [])
+    for e in board:
+        if e["name"] == name:
+            e["oss1"] = {k: oss1[k] for k in ("median_sharpe", "mean_sharpe", "pct_positive", "passed") if k in oss1}
+            board.sort(key=lambda x: -select_value(x))
+            return True
+    return False
+
+
+def unvalidated(state: dict, n: int) -> list[dict]:
+    """The n leaderboard entries with the best IS fitness that have not been run on OSS1 yet."""
+    todo = [e for e in state.get("leaderboard", []) if not e.get("oss1")]
+    return sorted(todo, key=lambda e: -rank_value(e))[:n]
+
+
 def _distinct_by_body(entries: list[dict]) -> list[dict]:
     """Keep the first entry per distinct strategy code: tuned/evolved copies of
     one idea differ only in parameters and would otherwise fill every slot."""
@@ -295,16 +330,16 @@ def _distinct_by_body(entries: list[dict]) -> list[dict]:
 
 
 def best_ever(state: dict, n: int) -> list[dict]:
-    ranked = sorted(state.get("leaderboard", []), key=lambda e: -rank_value(e))
+    ranked = sorted(state.get("leaderboard", []), key=lambda e: -select_value(e))
     return _distinct_by_body(ranked)[:n]
 
 
 def pick_parents(state: dict, n: int) -> list[dict]:
-    """Parents to improve next: highest score, discounted for how often each
-    has already been evolved (so the loop spreads effort instead of
-    re-mutating the champion forever)."""
+    """Parents to improve next: highest selection value (IS fitness blended with OSS1 once
+    validated), discounted for how often each has already been evolved (so the loop spreads
+    effort instead of re-mutating the champion forever)."""
     board = state.get("leaderboard", [])
-    ranked = sorted(board, key=lambda e: -(rank_value(e) - 0.07 * e.get("evolved", 0)))
+    ranked = sorted(board, key=lambda e: -(select_value(e) - 0.07 * e.get("evolved", 0)))
     return _distinct_by_body(ranked)[:n]
 
 

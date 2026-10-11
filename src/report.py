@@ -258,9 +258,34 @@ def write_markdown_report(strategy, symbol: str, source_filename: str, timeframe
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+OSS2_PLACEHOLDER = "Not evaluated. Run `python main.py final-test --file <strategy> --confirm` once, at the very end."
+
+
+def _per_symbol_chart(df: pd.DataFrame, title: str, out_path: Path) -> None:
+    """IS bars + OSS1 dots (+ OSS2 diamonds when the test column is present)."""
+    try:
+        fig, ax = plt.subplots(figsize=(8, max(4, 0.17 * len(df))))
+        y = np.arange(len(df))
+        colors = ["#2a9d8f" if p else "#9aa5b1" for p in df["passed"]]
+        ax.barh(y, df["avg_fold_sharpe"], color=colors, label="IS avg fold Sharpe (green = passes all criteria)")
+        ax.scatter(df["oss1_sharpe"], y, color="#e76f51", s=14, zorder=3, label="OSS1 (validation) Sharpe")
+        if "oss2_sharpe" in df.columns:
+            ax.scatter(df["oss2_sharpe"], y, color="#264653", marker="D", s=14, zorder=4, label="OSS2 (test) Sharpe")
+        ax.set_yticks(y)
+        ax.set_yticklabels(df["symbol"], fontsize=6)
+        ax.invert_yaxis()
+        ax.axvline(0, color="black", lw=0.6)
+        ax.set_title(f"{title}: per-symbol Sharpe")
+        ax.legend(fontsize=7, loc="lower right")
+        _save(fig, out_path)
+    except Exception as exc:  # a chart failure must never lose the strategy
+        logger.warning("Could not draw per-symbol chart for %s: %s", title, exc)
+
+
 def write_universe_report(strat_dir: Path, spec, compiled, result, oss1: dict, universe, accepted: bool = True) -> None:
     """Per-symbol table (CSV), an IS-vs-OSS1 bar chart and a short Markdown report.
-    OSS2 (test) never appears here: it is only read by `main.py final-test`."""
+    OSS2 (test) is not evaluated here; `append_oss2` adds it at the very end of a pipeline
+    run (or `main.py final-test` does it by hand)."""
     from src import insights  # local import: report.py is imported by older code paths without src.insights
 
     strat_dir = Path(strat_dir)
@@ -279,21 +304,7 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, oss1: dict, u
     df = pd.DataFrame(rows).sort_values("avg_fold_sharpe", ascending=False)
     df.to_csv(strat_dir / "per_symbol.csv", index=False)
 
-    try:
-        fig, ax = plt.subplots(figsize=(8, max(4, 0.17 * len(df))))
-        y = np.arange(len(df))
-        colors = ["#2a9d8f" if p else "#9aa5b1" for p in df["passed"]]
-        ax.barh(y, df["avg_fold_sharpe"], color=colors, label="IS avg fold Sharpe (green = passes all criteria)")
-        ax.scatter(df["oss1_sharpe"], y, color="#e76f51", s=14, zorder=3, label="OSS1 (validation) Sharpe")
-        ax.set_yticks(y)
-        ax.set_yticklabels(df["symbol"], fontsize=6)
-        ax.invert_yaxis()
-        ax.axvline(0, color="black", lw=0.6)
-        ax.set_title(f"{spec.name}: per-symbol Sharpe")
-        ax.legend(fontsize=7, loc="lower right")
-        _save(fig, strat_dir / "per_symbol.png")
-    except Exception as exc:  # a chart failure must never lose the strategy
-        logger.warning("Could not draw per-symbol chart for %s: %s", spec.name, exc)
+    _per_symbol_chart(df, spec.name, strat_dir / "per_symbol.png")
 
     s = result.summary
     lines = [
@@ -316,7 +327,7 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, oss1: dict, u
         + ("passed" if oss1.get("passed") else f"FAILED ({oss1.get('fail')})" if "passed" in oss1 else "n/a"),
         "",
         "## OSS2 (test segment)",
-        "Not evaluated. Run `python main.py final-test --file <strategy> --confirm` once, at the very end.",
+        OSS2_PLACEHOLDER,
         "",
         "## Parameters",
         f"`{spec.params}` | stop {compiled.stop_loss_pct} | target {compiled.take_profit_pct}",
@@ -326,3 +337,34 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, oss1: dict, u
         "_Research only; not financial advice._",
     ]
     (strat_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def append_oss2(strat_dir: Path, name: str, oss2: dict, verdict: str) -> None:
+    """Add the one-shot OSS2 (test) result to an already saved strategy folder: metadata.json,
+    a per-symbol column in per_symbol.csv, the chart and the report.md section."""
+    import json
+
+    strat_dir = Path(strat_dir)
+    meta_path = strat_dir / "metadata.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["oss2"] = {k: v for k, v in oss2.items() if k != "rows"} | {"verdict": verdict}
+        meta_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+    csv_path = strat_dir / "per_symbol.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        by_sym = {r["symbol"]: r for r in oss2.get("rows", [])}
+        df["oss2_sharpe"] = [round(by_sym.get(sym, {}).get("sharpe", float("nan")), 4) for sym in df["symbol"]]
+        df["oss2_trades"] = [by_sym.get(sym, {}).get("trades") for sym in df["symbol"]]
+        df.to_csv(csv_path, index=False)
+        _per_symbol_chart(df, name, strat_dir / "per_symbol.png")
+
+    report_path = strat_dir / "report.md"
+    if report_path.exists():
+        text = report_path.read_text(encoding="utf-8")
+        section = (f"Median Sharpe: {oss2['median_sharpe']:+.2f} | mean (clipped to +-1.5): {oss2['mean_sharpe']:+.2f} "
+                   f"| symbols profitable: {oss2['pct_positive']:.0%}\n\n**{verdict}**\n\n"
+                   "Evaluated exactly once, after the last generation. Do not tune this strategy further based on this number: "
+                   "it would turn OSS2 into a second validation set.")
+        report_path.write_text(text.replace(OSS2_PLACEHOLDER, section), encoding="utf-8")

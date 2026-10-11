@@ -500,3 +500,84 @@ def test_final_test_requires_confirm_and_logs_every_look(cfg, tmp_path, monkeypa
     ledger = read_ledger(ledger_path(cfg))
     assert len(ledger) == 2 and ledger[0]["signature"] == ledger[1]["signature"]
     assert ledger[0]["oss2_mean_sharpe"] == ledger[1]["oss2_mean_sharpe"]    # deterministic: a repeat look adds no information
+
+
+# ------------------------------------------- generations: validate -> adjust -> final test
+
+def _board_entry(name, fitness, oss1=None, freq=1.0):
+    e = {"name": name, "fitness": fitness, "score": fitness, "body": f"le = close > {name}", "summary": {"freq_factor": freq}}
+    if oss1 is not None:
+        e["oss1"] = {"mean_sharpe": oss1, "median_sharpe": oss1, "pct_positive": 0.6, "passed": True}
+    return e
+
+
+def test_validation_reranks_leaderboard_and_parents():
+    state = memory._empty_state()
+    state["leaderboard"] = [_board_entry("overfit", 0.50), _board_entry("robust", 0.40), _board_entry("meh", 0.20)]
+    assert [e["name"] for e in memory.unvalidated(state, 2)] == ["overfit", "robust"]       # best IS fitness first
+    assert memory.attach_oss1(state, "overfit", {"mean_sharpe": -0.30, "median_sharpe": -0.2, "pct_positive": 0.3, "passed": False})
+    assert memory.attach_oss1(state, "robust", {"mean_sharpe": 0.35, "median_sharpe": 0.3, "pct_positive": 0.7, "passed": True})
+    assert not memory.attach_oss1(state, "ghost", {"mean_sharpe": 1.0})
+    assert [e["name"] for e in state["leaderboard"]] == ["robust", "meh", "overfit"]         # 0.375 > 0.20 (unvalidated) > 0.10
+    assert [e["name"] for e in memory.pick_parents(state, 1)] == ["robust"]                  # the one that generalised becomes the parent
+    assert memory.rank_value(state["leaderboard"][0]) == 0.40                                # the tuner's IS fitness is untouched
+    assert [e["name"] for e in memory.unvalidated(state, 5)] == ["meh"]
+
+
+def test_llm_sees_how_its_parents_did_out_of_sample():
+    from src import insights
+    s = {"n_eval": 40, "score": 0.30, "trades_per_year": 20, "long_pnl_pct": 1, "short_pnl_pct": 1, "pct_positive": 0.7,
+         "pass_rate": 0.3, "group_mean_sharpe": {}, "fail_counts": {}, "no_trade_symbols": 0}
+    bad = {"mean_sharpe": -0.2, "pct_positive": 0.3}
+    assert "FAILS" in insights.validation_line(bad, s) and insights.diagnose(s, 10, oss1=bad).startswith("OVERFIT")
+    assert "holds up" in insights.validation_line({"mean_sharpe": 0.25, "pct_positive": 0.7}, s)
+    assert "degrades" in insights.validation_line({"mean_sharpe": 0.05, "pct_positive": 0.7}, s)
+    assert insights.validation_line(None, s) == "" and not insights.diagnose(s, 10).startswith("OVERFIT")
+
+
+def test_pipeline_runs_generations_then_tests_oss2_once(cfg, tmp_path, monkeypatch):
+    import json
+    import src.orchestrator as orch
+    from src.final_test import ledger_path, read_ledger
+    from fake_llm import FakeClient
+
+    monkeypatch.chdir(tmp_path)
+    cfg.memory.path = str(tmp_path / "memory" / "state.json")
+    cfg.run.explore_calls_per_iteration = 1
+    cfg.run.evolve_calls_per_iteration = 1
+    cfg.run.tune_seconds = 3
+    cfg.run.tune_processes = False
+    cfg.run.seed_samples_per_iteration = 4
+    cfg.run.save_top_n = 3
+    cfg.run.validate_top_k = 6
+    cfg.universe.max_symbols = 8
+    cfg.universe.accept = {"min_pass_rate": 0.0, "min_pct_positive": 0.0, "min_score": -1.0,
+                           "oss1": {"min_pct_positive": 0.0, "min_mean_sharpe": -9.0}}
+    monkeypatch.setattr(orch, "OpenRouterClient", FakeClient)
+    run_id = orch.run_research_loop(cfg, iterations=2, final_test=True)
+    run_dir = tmp_path / "results" / run_id
+
+    state = memory.load_memory(cfg.memory.path)
+    assert any(e.get("oss1") for e in state["leaderboard"])                      # generations validated their leaders on OSS1
+
+    res = pd.read_csv(run_dir / "oss2_results.csv")
+    top = pd.read_csv(run_dir / "top_strategies.csv")
+    assert 1 <= len(res) <= 3 and list(res["name"]) == list(top["name"])
+    assert {"oss2_mean_sharpe", "oss2_pct_positive", "verdict"} <= set(top.columns)
+    assert len(read_ledger(ledger_path(cfg))) == len(res)                       # exactly one logged look per strategy
+    for d in res["dir"]:
+        d = Path(d)
+        assert "oss2_sharpe" in pd.read_csv(d / "per_symbol.csv").columns
+        assert "Not evaluated" not in (d / "report.md").read_text(encoding="utf-8")
+        assert "oss2" in json.loads((d / "metadata.json").read_text(encoding="utf-8"))
+        assert next(d.glob("strat_gen_*.py")).exists()
+
+
+def test_pipeline_command_skips_oss2_with_flag_and_is_registered(cfg, tmp_path, monkeypatch):
+    import main as M
+    args = M.build_parser().parse_args(["pipeline", "--generations", "3", "--no-final-test", "--offline"])
+    assert args.func is M.cmd_pipeline and args.generations == 3 and args.no_final_test and args.offline
+    seen = {}
+    monkeypatch.setattr("src.orchestrator.run_research_loop", lambda cfg_, **kw: seen.update(kw) or "rid")
+    M.cmd_pipeline(args, cfg)
+    assert seen["final_test"] is False and seen["offline"] is True and seen["iterations"] == 3

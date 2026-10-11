@@ -16,7 +16,14 @@ One iteration:
 
 The data is split like a machine-learning problem (src.universe): the search
 learns from IS, OSS1 selects among the results, and OSS2 (test) is never touched
-here -- only `python main.py final-test` (src.final_test) reads it.
+by the loop itself. One iteration is one GENERATION:
+
+  generate (LLM + seeds) -> tune on IS -> validate the best on OSS1 -> the validated
+  scores pick the parents (and show the LLM how they did out of sample) -> next generation
+
+`python main.py pipeline` runs that for N generations (or until time runs out / Ctrl-C),
+saves the best strategies in full, and finally tests them on OSS2 exactly once
+(src.final_test.run_final_stage). `run` / `tune` stop before that last step.
 
 The optimisation targets are the user's: speed (parallel requests, numba
 backtests, probe pre-screen), cheap tokens (snippet format, ~10 strategies per
@@ -152,7 +159,8 @@ def _plan_jobs(cfg, state: dict, n_symbols: int, rng: random.Random) -> list[Gen
             infos = [{
                 "name": e["name"], "family": e.get("family", "other"), "idea": e.get("idea", ""), "sl": e.get("sl"),
                 "tp": e.get("tp"), "params": e.get("params", {}), "body": e.get("body", ""),
-                "results": insights.results_line(e["summary"]), "diagnosis": insights.diagnose(e["summary"], min_tpy),
+                "results": insights.results_line(e["summary"]) + insights.validation_line(e.get("oss1"), e["summary"]),
+                "diagnosis": insights.diagnose(e["summary"], min_tpy, oss1=e.get("oss1")),
                 "history": memory.lineage(state, e["name"]),
             } for e in chunk]
             n_expected = variants * len(chunk)
@@ -392,6 +400,34 @@ class Run:
                         "accepted": bool(result.summary.get("accepted")), "family": spec.family, "mutation": spec.mutation or ""})
         return out
 
+    # ---- validation ------------------------------------------------------
+
+    def validate_top(self, k: int) -> int:
+        """Run the k best not-yet-validated leaderboard strategies (by IS fitness) on OSS1 and
+        attach the result, which re-ranks the leaderboard by `memory.select_value`. This is the
+        'validate' step of a generation; the next generation's parents come out of it."""
+        done = 0
+        for e in memory.unvalidated(self.state, k):
+            name = e["name"]
+            oss1 = self.oss1_of.get(name)
+            if oss1 is None:
+                try:
+                    compiled = compile_strategy(build_source(StrategySpec.from_record(e), self.risk_per_trade))
+                    oss1 = self.oss1_of[name] = run_universe_oss1(compiled, self.universe, self.ev, self.cfg)
+                except Exception as exc:       # a leaderboard entry that no longer compiles must not be retried forever
+                    logger.warning("Could not validate '%s' (%s); marking it failed", name, str(exc)[:100])
+                    oss1 = {"median_sharpe": 0.0, "mean_sharpe": -1.5, "pct_positive": 0.0, "passed": False}
+            memory.attach_oss1(self.state, name, oss1)
+            done += 1
+        return done
+
+    def _log_validated_board(self, n: int = 3) -> None:
+        for e in memory.best_ever(self.state, n):
+            o = e.get("oss1")
+            logger.info("  leader %-34s IS fitness %+.3f | OSS1 %s | selection value %+.3f", e["name"], memory.rank_value(e),
+                        f"mean Sharpe {o['mean_sharpe']:+.2f}, {o['pct_positive']:.0%} profitable" if o else "not validated yet",
+                        memory.select_value(e))
+
     # ---- generation ------------------------------------------------------
 
     def _run_job(self, job: GenJob) -> JobOutput:
@@ -459,6 +495,10 @@ class Run:
             self.process_spec(spec, iteration, "seed")
         tune_seconds = float(self.cfg.run.get("tune_seconds", 60))
         tuning = tuner.run_tuning(self, iteration, tune_seconds * (1 if self.llm_ok else 2)) if not fatal else {}
+        n_validated = self.validate_top(int(self.cfg.run.get("validate_top_k", 12)))
+        if n_validated:
+            logger.info("Validated %d new strategies on OSS1; leaderboard by selection value (IS fitness blended with OSS1):", n_validated)
+            self._log_validated_board()
         self._checkpoint()
 
         new_rows = self.rows[rows_before:]
@@ -499,13 +539,15 @@ class Run:
 
 
 def run_research_loop(cfg, symbols: list[str] | None = None, iterations: int | None = None,
-                      minutes: float | None = None, offline: bool = False) -> str:
+                      minutes: float | None = None, offline: bool = False, final_test: bool = False) -> str:
     """Run the universe research loop. `iterations=0` (or None with
     run.iterations: 0) runs until the time limit, the LLM budget is exhausted,
     or Ctrl-C -- progress is checkpointed after every request. If the LLM quota
     or key dies, the run continues offline (seed templates + local mutation
     search) unless run.offline_fallback is false. `offline=True` skips the LLM
-    entirely (CLI: `python main.py tune`)."""
+    entirely (CLI: `python main.py tune`). `final_test=True` (CLI: `python main.py pipeline`)
+    ends the run, whether it finished or was interrupted with Ctrl-C, with the one-shot OSS2
+    test of the strategies it saved; otherwise OSS2 is not touched."""
     iterations = int(cfg.run.get("iterations", 10)) if iterations is None else int(iterations)
     minutes = cfg.run.get("max_minutes") if minutes is None else minutes
     run = Run(cfg, symbols, offline=offline)
@@ -538,11 +580,11 @@ def run_research_loop(cfg, symbols: list[str] | None = None, iterations: int | N
         logger.warning("Interrupted; saving progress")
     finally:
         run._checkpoint()
-        _finish(run)
+        _finish(run, final_test=final_test)
     return run.run_id
 
 
-def _finish(run: Run) -> None:
+def _finish(run: Run, final_test: bool = False) -> None:
     tuner.shutdown(run)
     run.client.usage.log_summary()
     run.client.usage.save(run.dir / "llm_usage.json")
@@ -552,6 +594,9 @@ def _finish(run: Run) -> None:
     top = run.save_top(int(run.cfg.run.get("save_top_n", 10)))
     if top:
         pd.DataFrame(top).to_csv(run.dir / "top_strategies.csv", index=False)
+    if final_test and top:
+        from src.final_test import run_final_stage       # the only OSS2 access in the loop's code path, and only on request
+        run_final_stage(run, top)
     memory.record_run(run.state, {
         "run_id": run.run_id, "strategies": len(run.rows), "evaluated": len(evaluated), "accepted": run.n_accepted,
         "best_score": top[0]["score"] if top else None, "tokens": usage["total_tokens"], "cost_usd": usage["cost_usd"],

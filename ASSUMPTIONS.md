@@ -693,9 +693,9 @@ instead of asking questions.
 
     | segment | ML role | dates (default) | who may use it |
     |---|---|---|---|
-    | **IS** | train | 2003 - 2016-12-31 (~60%) | everything: LLM feedback, local tuner fitness, walk-forward gate |
-    | **OSS1** | validation | 2017-01 - 2021-06-30 (~19%) | acceptance gate, ranking of the saved top N, your own judgement; **not** the LLM, **not** the tuner |
-    | **OSS2** | test | 2021-07 - 2026 (~21%) | only `python main.py final-test --confirm`, at the very end |
+    | **IS** | train | 2003 - 2016-12-31 (~60%) | local tuner fitness, walk-forward gate, the LLM's IS results |
+    | **OSS1** | validation | 2017-01 - 2021-06-30 (~19%) | acceptance gate, parent selection, evolve prompts (see #32), ranking of the saved top N; **not** the tuner's fitness |
+    | **OSS2** | test | 2021-07 - 2026 (~21%) | only the last step of `pipeline` / `python main.py final-test --confirm` |
 
     - **Calendar cutoffs shared by every symbol** (`split.is_end`, `split.oss1_end`),
       not per-symbol percentages. Markets are correlated; with per-symbol fractions a
@@ -739,3 +739,31 @@ instead of asking questions.
     - **Legacy**: `src/evaluation.py`, the single-symbol helpers in `src/report.py` and
       `pnl_viewer.ipynb` belong to the old single-symbol JSON-DSL pipeline. They keep
       their own "last fold = holdout" convention and were not changed.
+
+32. **`pipeline`: generations of generate -> validate on OSS1 -> adjust, then one OSS2 test.**
+    Requested workflow: loop several generations, validating on OSS1 and adjusting, until
+    done, then test everything on OSS2 once and print it. This deliberately lets OSS1 steer
+    the search (#31 first kept it out of the loop); that is what a validation set is for,
+    and it is the reason OSS2 exists.
+    - **Where OSS1 enters**: after each generation's tuning, the best `run.validate_top_k`
+      (12) unvalidated leaderboard entries are run on OSS1. `memory.select_value` =
+      0.5 x IS fitness + 0.5 x (OSS1 mean Sharpe x the IS trade-frequency factor if positive)
+      orders the leaderboard, picks parents (tuner and LLM evolve), and the best-ever
+      examples in explore prompts. Evolve prompts get a `VALIDATION ...` line and an
+      `OVERFIT` diagnosis hint when OSS1 is <= 0 or <50% of symbols profitable.
+    - **Where it does not**: the tuner's promotion test (`rank_value` = IS fitness vs the
+      mutant's IS fitness) and the mutation statistics stay IS-only, so mutants are
+      judged on the data they were trained on, like any training loop. Unvalidated entries
+      keep their IS fitness as selection value, so they can briefly outrank validated ones
+      until the next validation phase (usually the same generation, since the top IS
+      entries are validated first).
+    - **The cost of looping on OSS1**: every generation selects on the same validation
+      period, so OSS1 numbers get optimistic with the number of generations. Expect
+      IS > OSS1 > OSS2 on average (the first real offline run: +0.18 / +0.08 / -0.12).
+    - **Final stage** (`final_test.run_final_stage`): runs after the loop whether it ended
+      by count, `--minutes`, quota or Ctrl-C (Ctrl-C = "I am done", so an accidental one
+      does spend OSS2; use `--no-final-test` to avoid that). It tests only the saved top N,
+      once each, skips code already in the ledger, writes OSS2 into every strategy folder and
+      prints the verdict against the same bar as the OSS1 gate. The verdict is advisory.
+    - `run` / `tune` use the same generation loop (including validation) but never run the
+      final stage.

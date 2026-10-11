@@ -6,7 +6,10 @@ Usage:
     python main.py inspect-data --symbol "@TY"
     python main.py inspect-data --file ./data/A_OHLCV_@TY_minutes_1440.dat
     python main.py list-free-models
-    python main.py run                       # generate + test on the whole universe
+    python main.py pipeline --generations 10   # THE WHOLE WORKFLOW, one command: generate -> validate on OSS1 ->
+                                               # adjust -> validate again ... for N generations, save the best strategies,
+                                               # then test them on OSS2 exactly once and print the results
+    python main.py run                       # generate + validate on the whole universe (stops before OSS2)
     python main.py run --iterations 0 --minutes 120   # auto mode: until time/quota is up
     python main.py run --symbols "@TY,@ES"   # restrict the universe
     python main.py tune --minutes 30         # offline (no LLM): local evolutionary search on the leaderboard
@@ -79,6 +82,24 @@ def cmd_run(args, cfg) -> None:
     print(f"Results saved under results/{run_id}/")
 
 
+def cmd_pipeline(args, cfg) -> None:
+    """The full workflow in one command. Stop it whenever you are done with Ctrl-C: it then
+    saves the best strategies and runs the one-shot OSS2 test, exactly as at the end of a
+    normal run. `--no-final-test` skips OSS2 (the strategies are still saved)."""
+    from src.orchestrator import run_research_loop
+    run_id = run_research_loop(
+        cfg,
+        symbols=_split_symbols(args.symbols),
+        iterations=args.generations,
+        minutes=args.minutes,
+        offline=args.offline,
+        final_test=not args.no_final_test,
+    )
+    print(f"Pipeline complete: {run_id}")
+    print(f"Best strategies (code, report, per-symbol results incl. OSS2): results/{run_id}/strategies/")
+    print(f"OSS2 table: results/{run_id}/oss2_results.csv" if not args.no_final_test else "OSS2 was NOT evaluated (--no-final-test).")
+
+
 def cmd_tune(args, cfg) -> None:
     """Offline mode: no LLM calls. Seed templates + local mutation search over
     the leaderboard stored in results/memory, for as long as you let it run."""
@@ -124,6 +145,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--iterations", type=int, default=None, help="0 = run until --minutes / quota / budget runs out")
     p_run.add_argument("--minutes", type=float, default=None, help="Wall-clock limit for the run")
     p_run.set_defaults(func=cmd_run)
+
+    p_pipe = sub.add_parser("pipeline", help="Whole workflow in one command: generations of generate/validate(OSS1)/adjust, "
+                                             "save the best strategies, then ONE test on OSS2 with printed results")
+    p_pipe.add_argument("--generations", type=int, default=None, help="Number of generations (default: run.iterations; 0 = until --minutes / quota / Ctrl-C)")
+    p_pipe.add_argument("--minutes", type=float, default=None, help="Wall-clock limit for the generation loop")
+    p_pipe.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols (default: the whole universe)")
+    p_pipe.add_argument("--offline", action="store_true", help="No LLM: seed templates + local search only")
+    p_pipe.add_argument("--no-final-test", action="store_true", help="Stop after saving the strategies; do not touch OSS2")
+    p_pipe.set_defaults(func=cmd_pipeline)
 
     p_tune = sub.add_parser("tune", help="Offline: no LLM. Seed templates + local mutation search over the stored leaderboard")
     p_tune.add_argument("--symbols", type=str, default=None)

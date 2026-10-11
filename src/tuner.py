@@ -23,7 +23,7 @@ Fitness = frequency-adjusted universe score + a bonus for the share of symbols
 passing every walk-forward criterion (what acceptance needs). It is computed on
 SEARCH folds only. Picking the best of many candidates inflates it a little by
 construction; OSS1 (validation, evaluated for strategies that pass the IS screen
-and for the end-of-run shortlist) is the honest check. The tuner never sees OSS1/OSS2.
+and for the end-of-run shortlist) is the honest check. The tuner's fitness never uses OSS1/OSS2 (OSS1 only influences which parents it is given).
 """
 from __future__ import annotations
 

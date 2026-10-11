@@ -33,7 +33,10 @@ Put TradeStation `.dat` files in `./data`, named like
 python main.py inspect-data                      # list discovered .dat files
 python main.py list-free-models                  # currently-free OpenRouter models, ranked
 
-python main.py run                               # config.yaml defaults (10 iterations)
+python main.py pipeline --generations 10         # THE WHOLE WORKFLOW in one command (see "Pipeline")
+python main.py pipeline --generations 0 --minutes 180   # keep going for 3 hours; Ctrl-C = "I am done"
+python main.py pipeline --offline --generations 5       # no LLM: seed templates + local search
+python main.py run                               # config.yaml defaults (10 iterations); stops before OSS2
 python main.py run --iterations 0 --minutes 120  # run for 2 hours
 python main.py run --symbols "@TY,@ES,@GC"       # restrict the universe
 python main.py tune --minutes 30                 # offline local search, no LLM
@@ -74,20 +77,49 @@ Outputs land in `results/<run_id>/` (`all_experiments.csv`, `top_strategies.csv`
 `run.save_top_n` strategies are written out whether or not they were accepted. They
 are picked by OSS1 Sharpe from a shortlist of the best IS candidates.
 
+### Pipeline: generate, validate, adjust, repeat, then test once
+
+`python main.py pipeline --generations N` is the whole experiment in one command. One
+iteration is one **generation**:
+
+1. **Generate**: LLM explore/evolve requests plus seed templates, all scored on IS.
+2. **Tune**: the local search mutates the best strategies, maximising IS fitness only.
+3. **Validate**: the best `run.validate_top_k` strategies not yet validated are run on OSS1.
+   The result re-ranks the leaderboard (`memory.select_value` = IS fitness blended with the
+   OSS1 score), so strategies that were great in-sample but die out of sample sink.
+4. **Adjust**: the next generation's parents, for both the local tuner and the LLM evolve
+   requests, come from that validation-ranked leaderboard, and the LLM is shown how each
+   parent did on the validation period (plus an `OVERFIT` hint if it failed). Back to 1.
+
+After the last generation (the count, `--minutes`, quota exhaustion, or **Ctrl-C when you
+are done**) the run:
+
+5. saves the best `run.save_top_n` strategies in full under `results/<run_id>/strategies/<name>/`
+   (`strat_gen_<name>.py`, `report.md`, `metadata.json`, `per_symbol.csv/png`), chosen by OSS1
+   Sharpe from the best IS candidates;
+6. tests each of them on **OSS2 exactly once**, prints the IS / OSS1 / OSS2 table, writes the
+   OSS2 numbers into each strategy folder and `results/<run_id>/oss2_results.csv`, and logs
+   every look in `results/memory/oss2_ledger.jsonl`.
+
+`--no-final-test` skips step 6. A strategy whose code already appears in the ledger is not
+tested twice. Running `pipeline` repeatedly and keeping the run with the best OSS2 turns OSS2
+into a validation set; the ledger warns when earlier looks exist. `run` / `tune` do steps 1-5's
+generation loop but never touch OSS2.
+
 ### Data split (IS / OSS1 / OSS2)
 
 | | role | default dates | used by |
 |---|---|---|---|
-| **IS** | train | 2003 to 2016-12-31 | the LLM's feedback, the local tuner, the walk-forward gate |
-| **OSS1** | validation | 2017-01 to 2021-06-30 | acceptance, ranking of saved strategies, your decisions about config and ideas |
-| **OSS2** | test | 2021-07 onwards | `final-test` only, at the very end |
+| **IS** | train | 2003 to 2016-12-31 | the local tuner's fitness, the walk-forward gate |
+| **OSS1** | validation | 2017-01 to 2021-06-30 | every generation: parent selection, what the LLM is told about its parents, acceptance, ranking of saved strategies |
+| **OSS2** | test | 2021-07 onwards | `pipeline` (last step) or `final-test`, once, at the very end |
 
 The cutoffs are calendar dates shared by all symbols (`split:` in `config.yaml`), so no
-market's test period overlaps another market's training period. The search (LLM and local
-tuner) optimises on IS only and never sees OSS1 or OSS2 numbers. OSS1 is the model-selection
-set: you can look at it freely while tuning thresholds and ideas, knowing that doing so
-slowly overfits it. OSS2 is looked at once, with `final-test --confirm`; each look is
-logged in `results/memory/oss2_ledger.jsonl`. If you test, dislike the result and go back
+market's test period overlaps another market's training period. The local tuner optimises on
+IS only; OSS1 is the model-selection set, so the LLM and the parent choice do see validation
+numbers, which slowly overfits OSS1 over many generations. OSS2 is looked at once (end of
+`pipeline`, or `final-test --confirm`); each look is logged in
+`results/memory/oss2_ledger.jsonl`. If you test, dislike the result and go back
 to tweak, OSS2 has become another validation set. Details and caveats: `ASSUMPTIONS.md` #31.
 
 Changing `split:` changes what every stored score means, so reset `results/memory/` when

@@ -14,14 +14,14 @@ like train / validation / test in machine learning:
 
     [ IS: walk-forward folds | OSS1: validation | OSS2: test ]
 
-- IS is what the search optimises on (`evaluate_symbol`): the LLM's feedback, the
-  local tuner's fitness and the walk-forward acceptance criteria all use IS only.
-- OSS1 is consulted once per strategy that clears the IS gate (`run_universe_oss1`)
-  and decides acceptance and the final ranking. Its numbers never go into prompts
-  or into the tuner's fitness.
+- IS is what the search optimises on (`evaluate_symbol`): the local tuner's fitness and
+  the walk-forward acceptance criteria use IS only.
+- OSS1 is validation (`run_universe_oss1`): the best strategies of every generation are
+  run on it, and the result decides acceptance, parent selection, what the LLM is told
+  about its parents, and the final ranking. It never enters the tuner's fitness.
 - OSS2 is the test set. `run_universe_oss2` is called from exactly one place,
-  src.final_test (CLI: `python main.py final-test`); the research loop never
-  evaluates it.
+  src.final_test (`python main.py pipeline` at its very end, or `final-test`); the
+  generation loop itself never evaluates it.
 """
 from __future__ import annotations
 
