@@ -145,13 +145,20 @@ universe:
   # Probe symbols trading less than this fraction of min_trades_per_year are rejected early.
   probe_min_tpy_fraction: 0.4
   max_eval_seconds: 90
-  # A strategy is ACCEPTED (saved + holdout-checked) when, over the symbols:
+  # A strategy is ACCEPTED (saved) when, over the symbols:
   accept:
     min_pass_rate: 0.08      # share of symbols clearing every walk-forward criterion in `validation`
     min_pct_positive: 0.60   # share of symbols with positive average fold Sharpe
     min_score: 0.15          # frequency-adjusted mean (clipped) per-symbol average fold Sharpe
     min_trades_per_year: 10  # mean trades/yr per symbol; below this the score is scaled down by tpy/10
     fitness_pass_weight: 0.4 # searches maximise fitness = score + weight * (share of symbols passing every criterion)
+    # Second gate = the VALIDATION set (OSS1). A strategy that clears the IS gate above is
+    # then run once on OSS1 and is ACCEPTED only if it also holds up there. OSS1 numbers are
+    # never fed to the LLM or the local search (they search on IS only); they are for model
+    # selection: accepting, ranking the end-of-run top N, and your own judgement.
+    oss1:
+      min_pct_positive: 0.55  # share of symbols with positive Sharpe on OSS1
+      min_mean_sharpe: 0.10   # mean (clipped to +-1.5) per-symbol Sharpe on OSS1
 
 instruments:
   "@TY":
@@ -184,12 +191,33 @@ backtest:
   max_contracts: 5
   allow_fractional_contracts: false
 
+# Dataset split, treated like a machine-learning problem (see ASSUMPTIONS.md #31):
+#   IS   (train)      the search optimises on this: LLM + local tuner + walk-forward gate.
+#   OSS1 (validation) consulted for every strategy that passes the IS gate; picks the winners.
+#   OSS2 (test)       NEVER touched by `run` / `tune`. Only `python main.py final-test`
+#                     reads it, at the very end, and every peek is logged.
+# The cutoffs are calendar dates shared by ALL symbols (a per-symbol percentage would put
+# one market's test period inside another market's training period, and the markets are
+# correlated). Fixed dates also mean the boundary cannot drift when the universe changes.
+# ~23 years of data: IS 2003-2016 (60%), OSS1 2017-mid 2021 (19%), OSS2 mid 2021-2026 (21%).
+split:
+  is_end: "2016-12-31"     # last day of IS
+  oss1_end: "2021-06-30"   # last day of OSS1; everything after is OSS2
+  # Used only if is_end / oss1_end are null: per-symbol fractions of each series.
+  is_frac: 0.6
+  oss1_frac: 0.2
+  # Symbols with fewer bars in a segment are dropped from the universe (a 2-year IS or
+  # OSS cannot be judged).
+  min_is_bars: 1500
+  min_oss_bars: 250
+
 validation:
-  num_folds: 6
+  # Walk-forward folds INSIDE the in-sample (IS) period only (OSS1/OSS2 are not folds).
+  num_folds: 5
   # Frequency is part of validity: a "strategy" firing 2-5 times a year is a
   # handful of lucky positions. Every fold must hold at least
   # max(min_trades_per_fold, min_trades_per_year * fold_years) trades
-  # (10/yr over ~4-year folds = 40+ per fold, hundreds per symbol overall).
+  # (10/yr over ~3-year IS folds = 30+ per fold, hundreds per symbol overall).
   min_trades_per_fold: 10
   min_trades_per_year: 10
   min_avg_fold_sharpe: 0.3

@@ -683,3 +683,59 @@ instead of asking questions.
 - **Worker processes** reload the universe once each (~0.5s) and receive only small
   strategy specs; on Windows scripts that call the loop need an
   `if __name__ == "__main__":` guard. `run.tune_processes: false` uses threads.
+
+## IS / OSS1 / OSS2 split: the project as a machine-learning exercise (2026-10-12)
+
+31. **Three-way time split replaces "5 search folds + 1 holdout fold".** Previously
+    the last of 6 folds was a holdout, but it was evaluated for every accepted and
+    top-N strategy and printed in every report, run after run, so it quietly became
+    a validation set that a human selected on. The roles are now explicit:
+
+    | segment | ML role | dates (default) | who may use it |
+    |---|---|---|---|
+    | **IS** | train | 2003 - 2016-12-31 (~60%) | everything: LLM feedback, local tuner fitness, walk-forward gate |
+    | **OSS1** | validation | 2017-01 - 2021-06-30 (~19%) | acceptance gate, ranking of the saved top N, your own judgement; **not** the LLM, **not** the tuner |
+    | **OSS2** | test | 2021-07 - 2026 (~21%) | only `python main.py final-test --confirm`, at the very end |
+
+    - **Calendar cutoffs shared by every symbol** (`split.is_end`, `split.oss1_end`),
+      not per-symbol percentages. Markets are correlated; with per-symbol fractions a
+      short-history market's test period would overlap the training period of long-
+      history markets, leaking the same macro regimes (2020, 2022...) across the
+      boundary. Fixed dates also mean the boundary cannot drift when the universe
+      changes. `is_end`/`oss1_end: null` falls back to per-symbol `is_frac`/`oss1_frac`.
+    - **Cost**: symbols with fewer than `split.min_is_bars` (1500) bars in IS or
+      `min_oss_bars` (250) in OSS1/OSS2 are dropped (12 mostly 2013+ markets in the
+      shipped data, before the data-quality filter; 44 symbols remain). Judging a
+      strategy on 2 years of IS or 1 year of OSS is noise.
+    - **Walk-forward folds live inside IS only** (`validation.num_folds`, now 5, ~2.8
+      years each). All the old per-fold criteria (`min_avg_fold_sharpe`,
+      `min_fold_sharpe_floor`, consistency, drawdown, profit factor, trades per fold)
+      are unchanged, just applied to IS.
+    - **OSS1 gate** (`universe.accept.oss1`): a strategy that clears the IS screen is
+      evaluated once on OSS1 and is *accepted* only if the share of symbols with
+      positive Sharpe >= 0.55 and the mean clipped Sharpe >= 0.10. Strategies that
+      pass IS but fail here get status `oss1_failed` and the reason in
+      `all_experiments.csv`. The thresholds are a first guess, tune them.
+    - **Top-N selection**: the end-of-run top N are chosen by OSS1 mean Sharpe from a
+      shortlist of the 3N best distinct-code candidates by IS fitness (the tuner
+      promotes the best of many candidates, so IS scores are optimistic). Selecting on
+      OSS1 makes OSS1 optimistic too; that is expected and why OSS2 exists.
+    - **OSS2 isolation**: only `src/final_test.py` calls `run_universe_oss2`.
+      `run`, `tune` and `backtest-strategy` never do (a test monkeypatches
+      `segment_symbol` to fail if the research loop touches OSS2). Every
+      `final-test --confirm` appends to `results/memory/oss2_ledger.jsonl`, and prior
+      looks are printed before each new one. The ledger is a discipline aid, not a
+      lock: nothing stops you deleting it or reading OSS2 in a notebook.
+    - **Memory v4**: `results/memory/state.json` v3 is archived and the leaderboard
+      starts empty. Every previously found strategy was tuned on data that is now
+      OSS1/OSS2 (old search folds covered ~2003 to mid-2022), so keeping them as
+      parents would leak the validation and test periods into the search.
+      `experiments.jsonl` is append-only and now mixes old and new records; new ones
+      carry `"split": "is_oss1_oss2"`.
+    - **Known limitation**: OSS1 is reused for every strategy of every run, so over
+      many runs it too gets overfit (the usual validation-set caveat). Watch whether
+      the gap between OSS1 and OSS2 grows. If it does, the real fix is to move the
+      boundaries or add data, not to look at OSS2 more often.
+    - **Legacy**: `src/evaluation.py`, the single-symbol helpers in `src/report.py` and
+      `pnl_viewer.ipynb` belong to the old single-symbol JSON-DSL pipeline. They keep
+      their own "last fold = holdout" convention and were not changed.

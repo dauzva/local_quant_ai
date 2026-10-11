@@ -360,3 +360,143 @@ def test_offline_tune_runs_without_llm_and_saves_top_strategies(cfg, tmp_path, m
         assert (run_dir / "strategies" / name / "report.md").exists()
     state = memory.load_memory(cfg.memory.path)
     assert state["total_tried"] > 5 and state["mutation_stats"]       # the search ran and recorded operator outcomes
+
+
+# ------------------------------------------------ IS / OSS1 / OSS2 data split
+
+_SIMPLE = ("===S===\nname: simple_cross\nfamily: trend\nsl: 0.02\ntp: 0.04\nparams: {\"f\": 5, \"s\": 20}\n```python\n"
+           "le = crossover(ema(close, p[\"f\"]), ema(close, p[\"s\"]))\nlx = crossunder(ema(close, p[\"f\"]), ema(close, p[\"s\"]))\n"
+           "se = lx\nsx = le\n```")
+
+
+def test_split_is_ordered_disjoint_and_uses_shared_calendar_dates(cfg):
+    from src import universe as U
+    cfg.universe.max_symbols = 8
+    uni = U.load_universe(cfg)
+    assert uni
+    for sd in uni:
+        folds = sd.bounds
+        assert len(folds) == int(cfg.validation.num_folds)
+        assert folds[0][0] == 0 and all(folds[i][1] == folds[i + 1][0] for i in range(len(folds) - 1))   # IS folds tile IS exactly
+        assert folds[-1][1] == sd.oss1[0] and sd.oss1[1] == sd.oss2[0] and sd.oss2[1] == sd.n             # IS | OSS1 | OSS2 tile the series
+        assert sd.df.index[sd.oss1[0] - 1] <= pd.Timestamp(cfg.split.is_end) < sd.df.index[sd.oss1[0]]
+        assert sd.df.index[sd.oss2[0] - 1] <= pd.Timestamp(cfg.split.oss1_end) < sd.df.index[sd.oss2[0]]
+
+
+def test_split_falls_back_to_fractions_when_dates_are_unset():
+    from src import universe as U
+    idx = pd.date_range("2000-01-03", periods=1000, freq="B")
+    assert U.segment_edges(idx, {"is_end": None, "oss1_end": None, "is_frac": 0.6, "oss1_frac": 0.2}) == (600, 800)
+    with pytest.raises(ValueError):
+        U.segment_edges(idx, {"is_frac": 0.8, "oss1_frac": 0.3})
+    with pytest.raises(ValueError):
+        U.segment_edges(idx, {"is_end": "2002-01-01", "oss1_end": "2001-01-01"})
+
+
+def test_is_evaluation_cannot_see_oss_data(cfg):
+    """Scrambling every bar after the IS cutoff must not change a single IS number."""
+    import dataclasses
+    from src import universe as U
+    cfg.universe.max_symbols = 2
+    ev = U.build_eval_settings(cfg)
+    comp = compile_strategy(build_source(parse_specs(_SIMPLE)[0]))
+    for sd in U.load_universe(cfg):
+        cut = sd.oss1[0]
+        df2 = sd.df.copy()
+        rng = np.random.default_rng(0)
+        for col in ("open", "high", "low", "close"):
+            df2.iloc[cut:, df2.columns.get_loc(col)] = rng.uniform(1.0, 1000.0, len(df2) - cut)
+        sd2 = dataclasses.replace(sd, df=df2, open_=df2["open"].to_numpy(float), high=df2["high"].to_numpy(float),
+                                  low=df2["low"].to_numpy(float), close=df2["close"].to_numpy(float))
+        a, b = U.evaluate_symbol(comp, sd, ev, cfg), U.evaluate_symbol(comp, sd2, ev, cfg)
+        assert a.fold_sharpes == b.fold_sharpes and a.total_trades == b.total_trades and a.total_trades > 0
+
+
+def test_oss1_gate_verdict():
+    from src import universe as U
+    acc = {"oss1": {"min_pct_positive": 0.55, "min_mean_sharpe": 0.1}}
+    assert U.oss1_verdict({"pct_positive": 0.6, "mean_sharpe": 0.2}, acc) == (True, "")
+    ok, why = U.oss1_verdict({"pct_positive": 0.4, "mean_sharpe": 0.0}, acc)
+    assert not ok and "OSS1 profitable" in why and "mean Sharpe" in why
+    assert U.oss1_verdict({"pct_positive": 0.0, "mean_sharpe": -3.0}, {})[0]        # no gate configured -> always passes
+
+
+def test_research_loop_never_reads_oss2_but_does_use_oss1(cfg, tmp_path, monkeypatch):
+    import src.orchestrator as orch
+    from src import universe as U
+    from fake_llm import FakeClient
+
+    monkeypatch.chdir(tmp_path)
+    cfg.memory.path = str(tmp_path / "memory" / "state.json")
+    cfg.run.explore_calls_per_iteration = 1
+    cfg.run.evolve_calls_per_iteration = 1
+    cfg.run.tune_seconds = 3
+    cfg.run.tune_processes = False
+    cfg.run.seed_samples_per_iteration = 4
+    cfg.run.save_top_n = 3
+    cfg.universe.max_symbols = 8
+    cfg.universe.accept = {"min_pass_rate": 0.0, "min_pct_positive": 0.0, "min_score": -1.0,
+                           "oss1": {"min_pct_positive": 0.0, "min_mean_sharpe": -9.0}}
+    seen: set = set()
+    real = U.segment_symbol
+
+    def spy(compiled, sd, ev, cfg_, segment, sigs=None):
+        assert segment != sd.oss2, "the research loop evaluated the test set (OSS2)"
+        seen.add("oss1" if segment == sd.oss1 else "other")
+        return real(compiled, sd, ev, cfg_, segment, sigs)
+
+    def forbidden(*a, **k):
+        raise AssertionError("run_universe_oss2 called from the research loop")
+
+    monkeypatch.setattr(U, "segment_symbol", spy)
+    monkeypatch.setattr(U, "run_universe_oss2", forbidden)
+    monkeypatch.setattr(orch, "OpenRouterClient", FakeClient)
+    run_id = orch.run_research_loop(cfg, iterations=1)
+    assert "oss1" in seen and seen == {"oss1"}
+    top = pd.read_csv(tmp_path / "results" / run_id / "top_strategies.csv")
+    assert {"oss1_mean_sharpe", "oss1_pct_positive"} <= set(top.columns)
+    assert top["oss1_mean_sharpe"].is_monotonic_decreasing                # saved top-N is ranked by validation, not by IS
+    first = next((tmp_path / "results" / run_id / "strategies").iterdir())
+    assert "oss1_sharpe" in pd.read_csv(first / "per_symbol.csv").columns
+    assert "OSS2 (test segment)" in (first / "report.md").read_text(encoding="utf-8")
+
+
+def test_oss1_failure_blocks_acceptance(cfg, tmp_path, monkeypatch):
+    import src.orchestrator as orch
+    from fake_llm import FakeClient
+
+    monkeypatch.chdir(tmp_path)
+    cfg.memory.path = str(tmp_path / "memory" / "state.json")
+    cfg.run.explore_calls_per_iteration = 1
+    cfg.run.evolve_calls_per_iteration = 0
+    cfg.run.tune_seconds = 0
+    cfg.run.seed_samples_per_iteration = 4
+    cfg.universe.max_symbols = 8
+    cfg.universe.accept = {"min_pass_rate": 0.0, "min_pct_positive": 0.0, "min_score": -1.0,
+                           "oss1": {"min_pct_positive": 1.1, "min_mean_sharpe": 99.0}}      # impossible validation bar
+    monkeypatch.setattr(orch, "OpenRouterClient", FakeClient)
+    run_id = orch.run_research_loop(cfg, iterations=1)
+    df = pd.read_csv(tmp_path / "results" / run_id / "all_experiments.csv")
+    assert "accepted" not in set(df.status) and "oss1_failed" in set(df.status)
+    assert df.loc[df.status == "oss1_failed", "reasons"].str.contains("OSS1").all()
+    assert not list((tmp_path / "results" / run_id / "strategies").glob("*/metadata.json")) or all(
+        '"accepted": false' in m.read_text(encoding="utf-8") for m in (tmp_path / "results" / run_id / "strategies").glob("*/metadata.json"))
+
+
+def test_final_test_requires_confirm_and_logs_every_look(cfg, tmp_path, monkeypatch):
+    from src.final_test import ledger_path, read_ledger, run_final_test
+    monkeypatch.chdir(tmp_path)
+    cfg.memory.path = str(tmp_path / "memory" / "state.json")
+    cfg.universe.max_symbols = 3
+    src_file = tmp_path / "strat_gen_simple_cross.py"
+    src_file.write_text(build_source(parse_specs(_SIMPLE)[0]), encoding="utf-8")
+
+    assert run_final_test(str(src_file), cfg) is None                       # no --confirm: OSS2 stays unread
+    assert read_ledger(ledger_path(cfg)) == []
+
+    first = run_final_test(str(src_file), cfg, confirm=True)
+    assert first and {"oss2_mean_sharpe", "oss2_pct_positive", "oss1_mean_sharpe"} <= set(first)
+    run_final_test(str(src_file), cfg, confirm=True)
+    ledger = read_ledger(ledger_path(cfg))
+    assert len(ledger) == 2 and ledger[0]["signature"] == ledger[1]["signature"]
+    assert ledger[0]["oss2_mean_sharpe"] == ledger[1]["oss2_mean_sharpe"]    # deterministic: a repeat look adds no information

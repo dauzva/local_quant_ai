@@ -1,10 +1,11 @@
 # local_quant_ai
 
 Automated research loop for daily futures strategies. An LLM (via OpenRouter)
-mass-generates indicator-based strategies, each one is backtested on ~50 futures
-symbols from `./data` with multi-fold walk-forward validation and an untouched
-final holdout, and the best ones are evolved further, both by the LLM and by a
-free local search. Strategies that pass the universe-wide acceptance gate are
+mass-generates indicator-based strategies, each one is backtested on ~45 futures
+symbols from `./data`, and the best ones are evolved further, both by the LLM and by a
+free local search. The project is run like a machine-learning experiment: the data is
+split in time into **IS** (train), **OSS1** (validation) and **OSS2** (test), see
+"Data split" below. Strategies that pass the universe-wide acceptance gate are
 saved as standalone Python files.
 
 **Research tool only. No live trades are placed. Not financial advice.**
@@ -37,8 +38,11 @@ python main.py run --iterations 0 --minutes 120  # run for 2 hours
 python main.py run --symbols "@TY,@ES,@GC"       # restrict the universe
 python main.py tune --minutes 30                 # offline local search, no LLM
 
-# Re-run one saved strategy across the universe
+# Re-run one saved strategy across the universe (IS + OSS1; never OSS2)
 python main.py backtest-strategy --file results/<run_id>/strategies/<name>/strat_gen_<name>.py
+
+# THE TEST SET, once, at the very end (without --confirm it only shows the ledger of past looks)
+python main.py final-test --file results/<run_id>/strategies/<name>/strat_gen_<name>.py --confirm
 
 python -m pytest tests -q                        # offline tests, no API key needed
 ```
@@ -47,27 +51,47 @@ python -m pytest tests -q                        # offline tests, no API key nee
 
 1. **Universe**: loads every symbol in `./data`. Unusable series (e.g.
    back-adjusted contracts with negative prices), near-duplicates and short
-   histories are dropped (see `universe:` in `config.yaml`; ~51 symbols remain).
+   histories are dropped (see `universe:` and `split:` in `config.yaml`; ~44 symbols remain).
 2. **Generate**: each iteration sends several concurrent LLM requests. *Explore*
    requests ask for ~10 fresh strategies seeded with random themes. *Evolve*
    requests send the best strategies back with their code, per-asset-class
    results and a rule-based diagnosis, and ask for improvements.
 3. **Validate**: every strategy passes the sandbox (see "Safety") and is
    deduplicated by structural and behavioral fingerprint before any backtest.
-4. **Evaluate**: a numba backtester runs 5 walk-forward folds per symbol; a
-   12-symbol probe stops clearly bad strategies early. The universe **score** is
-   the mean per-symbol fold Sharpe, scaled down for low trade frequency.
-5. **Accept**: strategies that clear `universe.accept` (breadth across markets,
-   not one lucky chart) get a one-shot holdout evaluation, which is never fed
-   back, and are saved as `strat_gen_<name>.py`, `report.md`, `per_symbol.csv/png`
-   and `metadata.json`.
+4. **Evaluate (IS)**: a numba backtester runs 5 walk-forward folds per symbol inside
+   the IS period; a 12-symbol probe stops clearly bad strategies early. The universe
+   **score** is the mean per-symbol fold Sharpe, scaled down for low trade frequency.
+5. **Accept**: strategies that clear the IS screen in `universe.accept` (breadth across
+   markets, not one lucky chart) are run once on OSS1 and accepted only if they also
+   clear `universe.accept.oss1`. Accepted strategies are saved as
+   `strat_gen_<name>.py`, `report.md`, `per_symbol.csv/png` and `metadata.json`.
 6. **Remember**: `results/memory/` stores the leaderboard, fingerprints,
    per-family hit rates and common errors. State is checkpointed after every
    LLM response, so Ctrl-C is safe.
 
 Outputs land in `results/<run_id>/` (`all_experiments.csv`, `top_strategies.csv`,
 `llm_usage.json`, `strategies/`). At the end of each run the top
-`run.save_top_n` strategies are written out whether or not they were accepted.
+`run.save_top_n` strategies are written out whether or not they were accepted. They
+are picked by OSS1 Sharpe from a shortlist of the best IS candidates.
+
+### Data split (IS / OSS1 / OSS2)
+
+| | role | default dates | used by |
+|---|---|---|---|
+| **IS** | train | 2003 to 2016-12-31 | the LLM's feedback, the local tuner, the walk-forward gate |
+| **OSS1** | validation | 2017-01 to 2021-06-30 | acceptance, ranking of saved strategies, your decisions about config and ideas |
+| **OSS2** | test | 2021-07 onwards | `final-test` only, at the very end |
+
+The cutoffs are calendar dates shared by all symbols (`split:` in `config.yaml`), so no
+market's test period overlaps another market's training period. The search (LLM and local
+tuner) optimises on IS only and never sees OSS1 or OSS2 numbers. OSS1 is the model-selection
+set: you can look at it freely while tuning thresholds and ideas, knowing that doing so
+slowly overfits it. OSS2 is looked at once, with `final-test --confirm`; each look is
+logged in `results/memory/oss2_ledger.jsonl`. If you test, dislike the result and go back
+to tweak, OSS2 has become another validation set. Details and caveats: `ASSUMPTIONS.md` #31.
+
+Changing `split:` changes what every stored score means, so reset `results/memory/` when
+you do.
 
 ### Trade frequency
 
@@ -94,6 +118,9 @@ and token-free:
   and the measured effect of earlier changes.
 - **Offline fallback**: if the quota or key dies, the run continues with seeds
   and local search (`run.offline_fallback`).
+- **Memory is tied to the split**: the leaderboard holds IS scores. When the split
+  was introduced (state v4) the old leaderboard was archived, because its strategies had
+  been tuned on what is now validation/test data.
 
 ## Strategy format
 

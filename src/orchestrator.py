@@ -10,8 +10,13 @@ One iteration:
      snippets, wrap + sandbox-check them, drop structural/behavioral
      duplicates, and run the survivors across the whole universe while the
      other requests are still in flight.
-  3. Strategies passing the universe screen get the one-shot reserved-holdout
-     check and are saved; everything is written to the cross-run memory.
+  3. Strategies passing the IS universe screen are run once on OSS1 (validation)
+     and are accepted + saved only if they hold up there; everything is written
+     to the cross-run memory.
+
+The data is split like a machine-learning problem (src.universe): the search
+learns from IS, OSS1 selects among the results, and OSS2 (test) is never touched
+here -- only `python main.py final-test` (src.final_test) reads it.
 
 The optimisation targets are the user's: speed (parallel requests, numba
 backtests, probe pre-screen), cheap tokens (snippet format, ~10 strategies per
@@ -39,7 +44,7 @@ from src.strategy_codegen import (StrategySpec, build_evolve_prompt, build_explo
                                   friendly_problem, parse_specs)
 from src.strategy_sandbox import CompiledStrategy, StrategySandboxError, compile_strategy
 from src.universe import (SymbolData, UniverseResult, behavior_signature, build_eval_settings, evaluate_universe,
-                          load_universe, pick_probe, run_universe_holdout)
+                          load_universe, pick_probe, run_universe_oss1)
 from src.utils import get_logger, new_run_id, safe_strategy_dirname, strategy_filename
 
 logger = get_logger("orchestrator")
@@ -47,6 +52,7 @@ logger = get_logger("orchestrator")
 BEHAVIOR_REF_SYMBOLS = 3
 NAMES_IN_PROMPT = 40
 BEST_IN_EXPLORE_PROMPT = 3
+SHORTLIST_PER_SLOT = 3          # end of run: this many IS-ranked candidates compete on OSS1 for each saved slot
 
 
 @dataclass
@@ -206,6 +212,7 @@ class Run:
                                                          for e in self.state.get("leaderboard", [])}
         # fully evaluated strategies of this run, for saving the top N at the end
         self.kept: dict[str, tuple[StrategySpec, CompiledStrategy, UniverseResult, str]] = {}
+        self.oss1_of: dict[str, dict] = {}     # name -> OSS1 result (validation), computed at most once per strategy
         self.tune_executor = None          # process pool, created lazily by src.tuner
         self.tune_pool_broken = False
 
@@ -267,32 +274,40 @@ class Run:
 
     def _finalize(self, spec: StrategySpec, compiled: CompiledStrategy, result: UniverseResult, behavior: str,
                   iteration: int, model: str, tuned: bool = False) -> dict:
-        """Everything after a universe evaluation: holdout + save when accepted,
-        memory, experiment log, lessons, and the CSV row."""
+        """Everything after a universe evaluation: the OSS1 validation gate + save when
+        accepted, memory, experiment log, lessons, and the CSV row."""
         state = self.state
         record = spec.to_record()
         s = result.summary
-        accepted = bool(s.get("accepted"))
-        holdout = None
-        if accepted:
-            holdout = run_universe_holdout(compiled, self.universe, self.ev, self.cfg)
-            self._save_strategy(compiled, spec, result, holdout, model, accepted=True)
-            self.n_accepted += 1
-            logger.info("ACCEPTED %-34s score %+.2f | %.0f%% profitable | passes %d/%d | %.0f trades/yr | holdout median Sharpe %+.2f",
-                        spec.name, s["score"], 100 * s["pct_positive"], s["n_pass"], s["n_eval"], s["trades_per_year"],
-                        holdout["median_sharpe"])
+        passed_is = bool(s.get("accepted"))           # IS screen only
+        accepted = passed_is
+        oss1 = None
+        if passed_is:
+            # Validation: only strategies that already cleared the IS screen are looked at on OSS1.
+            oss1 = self.oss1_of[spec.name] = run_universe_oss1(compiled, self.universe, self.ev, self.cfg)
+            accepted = s["accepted"] = bool(oss1["passed"])
+            if accepted:
+                self._save_strategy(compiled, spec, result, oss1, model, accepted=True)
+                self.n_accepted += 1
+                logger.info("ACCEPTED %-34s IS score %+.2f | %.0f%% profitable | passes %d/%d | %.0f trades/yr | OSS1 mean Sharpe %+.2f (%.0f%% profitable)",
+                            spec.name, s["score"], 100 * s["pct_positive"], s["n_pass"], s["n_eval"], s["trades_per_year"],
+                            oss1["mean_sharpe"], 100 * oss1["pct_positive"])
+            else:
+                s["reject_reason"] = oss1["fail"]
+                logger.info("passed IS but FAILED OSS1: %-30s IS score %+.2f | %s", spec.name, s["score"], oss1["fail"])
 
         memory.record_result(state, spec=record, summary=s, run_id=self.run_id, iteration=iteration,
-                             signature=compiled.signature, behavior=behavior, accepted=accepted, holdout=holdout)
+                             signature=compiled.signature, behavior=behavior, accepted=accepted, oss1=oss1)
         if s.get("trades_per_year", 99) < self.min_tpy:
             memory.record_invalid(state, [f"too few trades: {s.get('trades_per_year', 0):.1f}/yr (< {self.min_tpy:.0f} required): "
                                           "shorter lookbacks, shallower thresholds, fewer AND conditions, add exits and the short side"])
         if result.probe_only:
             status = "low_frequency" if str(s.get("reject_reason", "")).startswith("low_frequency") else "probe_rejected"
         else:
-            status = "accepted" if accepted else "rejected"
+            status = "accepted" if accepted else ("oss1_failed" if passed_is else "rejected")
         memory.append_experiment({
             "run_id": self.run_id, "iteration": iteration, "model": model, **record, "tuned": tuned, "status": status,
+            "split": "is_oss1_oss2", "oss1": {k: oss1[k] for k in ("median_sharpe", "mean_sharpe", "pct_positive")} if oss1 else None,
             "summary": {k: v for k, v in s.items() if k not in ("best_symbols", "worst_symbols")},
             "per_symbol": {r.symbol: [round(r.avg_sharpe, 3), round(r.min_sharpe, 3), r.total_trades] for r in result.per_symbol},
         }, self.experiments_path)
@@ -316,11 +331,12 @@ class Run:
             median_sharpe=s.get("median_sharpe"), pct_positive=s.get("pct_positive"), n_pass=s.get("n_pass"),
             n_eval=s.get("n_eval"), trades_per_year=s.get("trades_per_year"), trades_per_symbol=s.get("trades_per_symbol"),
             eval_seconds=round(result.seconds, 2), tuned=tuned,
-            reasons=s.get("reject_reason", ""), holdout_median_sharpe=holdout["median_sharpe"] if holdout else None,
+            reasons=s.get("reject_reason", ""), oss1_mean_sharpe=oss1["mean_sharpe"] if oss1 else None,
+            oss1_pct_positive=oss1["pct_positive"] if oss1 else None,
         )
 
     def _save_strategy(self, compiled: CompiledStrategy, spec: StrategySpec, result: UniverseResult,
-                       holdout: dict, model: str, accepted: bool) -> Path:
+                       oss1: dict, model: str, accepted: bool) -> Path:
         """Write strat_gen_<name>.py + metadata + per-symbol table/chart + report under
         strategies/<name>/. Used for accepted strategies and for the end-of-run
         top-N (accepted=False)."""
@@ -333,35 +349,47 @@ class Run:
             "stop_loss_pct": compiled.stop_loss_pct,
             "take_profit_pct": compiled.take_profit_pct, "signature": compiled.signature, "model_used": model,
             "universe_symbols": len(self.universe), "universe_summary": result.summary,
-            "holdout": {k: v for k, v in holdout.items() if k != "rows"},
+            "oss1": {k: v for k, v in oss1.items() if k != "rows"},
+            "oss2": "not evaluated here; run `python main.py final-test --file <this strategy>` once, at the very end",
         }
         (strat_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
-        write_universe_report(strat_dir, spec, compiled, result, holdout, self.universe, accepted=accepted)
+        write_universe_report(strat_dir, spec, compiled, result, oss1, self.universe, accepted=accepted)
         return strat_dir
 
     def save_top(self, n: int) -> list[dict]:
-        """Save the top-n strategies of this run (by search score, distinct
-        code) into strategies/, accepted or not, so the best results are
-        always available as ready-to-use files. The holdout is evaluated for
-        the report only; ranking uses search folds exclusively."""
+        """Model selection: shortlist the best distinct-code candidates of this run by IS
+        fitness, score the shortlist on OSS1 (validation), and save the n with the best
+        OSS1 mean Sharpe -- accepted or not -- as ready-to-use files. The IS fitness alone
+        picks who gets to compete, because the tuner promotes the best of many candidates
+        and IS scores are therefore optimistic; OSS1 breaks the tie honestly. OSS2 is not
+        touched."""
         ranked = sorted(self.kept.values(), key=lambda t: -t[2].summary.get("fitness", t[2].summary.get("score", -9)))
-        out, seen = [], set()
-        for spec, compiled, result, model in ranked:
-            key = re.sub(r"\s+", " ", spec.body).strip()      # one slot per distinct code (not per parameter set)
+        shortlist, seen = [], set()
+        for item in ranked:
+            key = re.sub(r"\s+", " ", item[0].body).strip()      # one slot per distinct code (not per parameter set)
             if key in seen:
                 continue
             seen.add(key)
+            shortlist.append(item)
+            if len(shortlist) >= n * SHORTLIST_PER_SLOT:
+                break
+        for spec, compiled, _result, _model in shortlist:
+            if spec.name not in self.oss1_of:
+                self.oss1_of[spec.name] = run_universe_oss1(compiled, self.universe, self.ev, self.cfg)
+        shortlist.sort(key=lambda t: -self.oss1_of[t[0].name]["mean_sharpe"])
+
+        out = []
+        for spec, compiled, result, model in shortlist[:n]:
+            oss1 = self.oss1_of[spec.name]
             d = self.dir / "strategies" / safe_strategy_dirname(spec.name)
             if not d.exists():
-                holdout = run_universe_holdout(compiled, self.universe, self.ev, self.cfg)
-                d = self._save_strategy(compiled, spec, result, holdout, model, accepted=bool(result.summary.get("accepted")))
+                d = self._save_strategy(compiled, spec, result, oss1, model, accepted=bool(result.summary.get("accepted")))
             out.append({"name": spec.name, "dir": str(d), "score": result.summary.get("score"),
                         "pct_positive": result.summary.get("pct_positive"), "n_pass": result.summary.get("n_pass"),
                         "trades_per_year": result.summary.get("trades_per_year"),
                         "trades_per_symbol": result.summary.get("trades_per_symbol"),
+                        "oss1_mean_sharpe": oss1["mean_sharpe"], "oss1_pct_positive": oss1["pct_positive"],
                         "accepted": bool(result.summary.get("accepted")), "family": spec.family, "mutation": spec.mutation or ""})
-            if len(out) >= n:
-                break
         return out
 
     # ---- generation ------------------------------------------------------
@@ -536,17 +564,19 @@ def _finish(run: Run) -> None:
         logger.info("Tokens per evaluated strategy: %.0f | per accepted: %s", usage["total_tokens"] / len(evaluated),
                     f"{usage['total_tokens'] / run.n_accepted:.0f}" if run.n_accepted else "n/a")
     for i, r in enumerate(top, start=1):
-        logger.info("  #%-2d %-36s score %+.3f | %.0f%% markets profitable | %s trades/yr (~%s per market) | passes %s/%d | %s",
+        logger.info("  #%-2d %-36s IS score %+.3f | %.0f%% markets profitable | %s trades/yr (~%s per market) | passes %s/%d | "
+                    "OSS1 mean Sharpe %+.2f (%.0f%% profitable) | %s",
                     i, r["name"], r["score"], 100 * (r.get("pct_positive") or 0), f"{r['trades_per_year']:.0f}",
                     r.get("trades_per_symbol"), r.get("n_pass"), len(run.universe),
-                    "ACCEPTED" if r["accepted"] else "not accepted")
+                    r["oss1_mean_sharpe"], 100 * r["oss1_pct_positive"], "ACCEPTED" if r["accepted"] else "not accepted")
     if top:
         logger.info("Generated %d strategies (strat_gen_<name>.py + report.md + per_symbol.csv/png) in %s", len(top), run.dir / "strategies")
 
 
 def backtest_single_strategy_file(strategy_path: str, cfg, symbols: list[str] | None = None) -> None:
     """CLI helper: run one saved strategy.py across the universe (or the given
-    symbols) and print the per-symbol table + holdout summary."""
+    symbols) and print the per-symbol IS table + the OSS1 (validation) summary.
+    Never touches OSS2; that is `final-test`."""
     source = Path(strategy_path).read_text(encoding="utf-8")
     try:
         compiled = compile_strategy(source)
@@ -563,7 +593,9 @@ def backtest_single_strategy_file(strategy_path: str, cfg, symbols: list[str] | 
     for r in sorted(result.per_symbol, key=lambda r: -r.avg_sharpe):
         print(f"{r.symbol:14s} {r.group:13s} {r.avg_sharpe:10.2f} {r.min_sharpe:9.2f} {r.total_trades:7d} {str(r.passed):>5s}  {r.fold_sharpes}"
               + (f"  ERROR {r.error}" if r.error else ""))
-    h = run_universe_holdout(compiled, universe, ev, cfg)
-    print(f"\nReserved holdout (never used for selection): median Sharpe {h['median_sharpe']:+.2f}, "
-          f"mean (clipped) {h['mean_sharpe']:+.2f}, {h['pct_positive']:.0%} of symbols profitable")
-    print(f"Universe screen: {'ACCEPTED' if s.get('accepted') else 'not accepted'}")
+    o = run_universe_oss1(compiled, universe, ev, cfg)
+    print(f"\nOSS1 (validation): median Sharpe {o['median_sharpe']:+.2f}, mean (clipped) {o['mean_sharpe']:+.2f}, "
+          f"{o['pct_positive']:.0%} of symbols profitable -> {'passes' if o['passed'] else 'FAILS: ' + o['fail']}")
+    print(f"IS universe screen: {'passed' if s.get('accepted') else 'not passed'}"
+          f" | overall: {'ACCEPTED' if s.get('accepted') and o['passed'] else 'not accepted'}")
+    print("OSS2 (test) is not shown here. When you are completely done iterating: python main.py final-test --file <strategy> --confirm")

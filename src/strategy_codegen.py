@@ -503,7 +503,7 @@ the line ===S===). No thinking, no preface, no explanations, no summary, no mark
 {example}
 family = trend|breakout|meanrev|momentum|volatility|pattern|seasonal; sl 0.005-0.1 and tp 0.01-0.5 (fractions of entry price)."""
 
-_WHY_BLOCK = """HOW YOU ARE SCORED: score = mean over markets of the average walk-forward Sharpe (5 time folds), multiplied down if the
+_WHY_BLOCK = """HOW YOU ARE SCORED: score = mean over markets of the average walk-forward Sharpe (several consecutive time folds), multiplied down if the
 strategy trades fewer than {min_tpy:.0f} times/yr. Acceptance needs >= {accept_pct:.0%} of markets profitable AND passing every fold
 (positive Sharpe in each period, enough trades in each period, drawdown limits). One lucky market does not count; breadth and
 steady trade flow do."""

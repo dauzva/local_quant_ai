@@ -22,8 +22,8 @@ What makes it learn rather than random-walk:
 Fitness = frequency-adjusted universe score + a bonus for the share of symbols
 passing every walk-forward criterion (what acceptance needs). It is computed on
 SEARCH folds only. Picking the best of many candidates inflates it a little by
-construction; the reserved holdout (evaluated when a strategy is saved) is the
-honest check.
+construction; OSS1 (validation, evaluated for strategies that pass the IS screen
+and for the end-of-run shortlist) is the honest check. The tuner never sees OSS1/OSS2.
 """
 from __future__ import annotations
 

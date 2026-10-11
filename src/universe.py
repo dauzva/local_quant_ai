@@ -9,10 +9,19 @@ Everything in the hot path works on raw numpy arrays (see
 src.backtester._simulate) -- the pandas DataFrame is only touched to run the
 strategy's own signals() once per symbol.
 
-The final fold of every symbol is a reserved holdout, exactly as before: it is
-only evaluated for strategies that already passed the universe screen
-(`holdout_symbol`) and its numbers never go into prompts or the leaderboard
-ranking.
+The history of every symbol is cut in time order into three segments, exactly
+like train / validation / test in machine learning:
+
+    [ IS: walk-forward folds | OSS1: validation | OSS2: test ]
+
+- IS is what the search optimises on (`evaluate_symbol`): the LLM's feedback, the
+  local tuner's fitness and the walk-forward acceptance criteria all use IS only.
+- OSS1 is consulted once per strategy that clears the IS gate (`run_universe_oss1`)
+  and decides acceptance and the final ranking. Its numbers never go into prompts
+  or into the tuner's fitness.
+- OSS2 is the test set. `run_universe_oss2` is called from exactly one place,
+  src.final_test (CLI: `python main.py final-test`); the research loop never
+  evaluates it.
 """
 from __future__ import annotations
 
@@ -66,7 +75,9 @@ class SymbolData:
     high: np.ndarray
     low: np.ndarray
     close: np.ndarray
-    bounds: list[tuple[int, int]]      # fold slices; the LAST one is the holdout
+    bounds: list[tuple[int, int]]      # walk-forward fold slices INSIDE the IS segment
+    oss1: tuple[int, int]              # validation segment (bar slice)
+    oss2: tuple[int, int]              # test segment (bar slice); only src.final_test reads it
     instrument: dict
     initial_capital: float
     years: float
@@ -132,13 +143,37 @@ def build_eval_settings(cfg) -> EvalSettings:
 # --------------------------------------------------------------------------
 
 def _fold_bounds(n: int, num_folds: int) -> list[tuple[int, int]]:
-    """Same split as src.evaluation.split_folds (np.array_split semantics)."""
+    """Contiguous, time-ordered folds covering bars [0, n) (np.array_split semantics)."""
     sizes = [n // num_folds + (1 if i < n % num_folds else 0) for i in range(num_folds)]
     bounds, start = [], 0
     for s in sizes:
         bounds.append((start, start + s))
         start += s
     return bounds
+
+
+def segment_edges(index: pd.DatetimeIndex, split_cfg) -> tuple[int, int]:
+    """Bar positions (is_n, oss1_n) such that IS = [0, is_n), OSS1 = [is_n, oss1_n),
+    OSS2 = [oss1_n, len). With `split.is_end` / `split.oss1_end` set, the cutoffs are
+    calendar dates shared by every symbol; otherwise per-symbol fractions."""
+    n = len(index)
+    is_end, oss1_end = split_cfg.get("is_end"), split_cfg.get("oss1_end")
+    if is_end and oss1_end:
+        def pos(date) -> int:
+            ts = pd.Timestamp(date)
+            if index.tz is not None and ts.tzinfo is None:
+                ts = ts.tz_localize(index.tz)
+            return int(index.searchsorted(ts, side="right"))     # bars dated <= cutoff
+        a, b = pos(is_end), pos(oss1_end)
+        if a > b:
+            raise ValueError(f"split.is_end ({is_end}) must be before split.oss1_end ({oss1_end})")
+        return a, b
+    is_frac = float(split_cfg.get("is_frac", 0.6))
+    oss1_frac = float(split_cfg.get("oss1_frac", 0.2))
+    if not 0 < is_frac < 1 or not 0 < oss1_frac < 1 or is_frac + oss1_frac >= 1:
+        raise ValueError("split.is_frac and split.oss1_frac must be in (0, 1) and leave room for OSS2")
+    a = int(round(n * is_frac))
+    return a, int(round(n * (is_frac + oss1_frac)))
 
 
 def select_symbols(cfg, available: list[str], requested: list[str] | None = None) -> list[str]:
@@ -188,6 +223,9 @@ def load_universe(cfg, requested: list[str] | None = None) -> list[SymbolData]:
     capital_per_notional = float(cfg.backtest.get("capital_per_notional", 0.0) or 0.0)
     base_capital = float(cfg.backtest.get("initial_capital", 100_000))
     num_folds = int(cfg.validation.num_folds)
+    split_cfg = cfg.get("split", {}) or {}
+    min_is_bars = int(split_cfg.get("min_is_bars", num_folds * 100))
+    min_oss_bars = int(split_cfg.get("min_oss_bars", 250))
 
     file_map = discover_dat_files(cfg)
     symbols = select_symbols(cfg, list(file_map.keys()), requested)
@@ -203,8 +241,10 @@ def load_universe(cfg, requested: list[str] | None = None) -> list[SymbolData]:
         if len(df) < min_bars and not requested:
             logger.info("Skipping %s: only %d bars (< universe.min_bars=%d)", symbol, len(df), min_bars)
             continue
-        if len(df) < num_folds * 20:
-            logger.warning("Skipping %s: too few bars (%d)", symbol, len(df))
+        is_n, oss1_n = segment_edges(df.index, split_cfg)
+        if is_n < min_is_bars or oss1_n - is_n < min_oss_bars or len(df) - oss1_n < min_oss_bars:
+            logger.info("Skipping %s: too little history for the IS/OSS1/OSS2 split (%d / %d / %d bars; need >= %d / %d / %d)",
+                        symbol, is_n, oss1_n - is_n, len(df) - oss1_n, min_is_bars, min_oss_bars, min_oss_bars)
             continue
         bad = _data_quality_problem(df, ucfg)
         if bad and not requested:
@@ -229,10 +269,12 @@ def load_universe(cfg, requested: list[str] | None = None) -> list[SymbolData]:
             high=df["high"].to_numpy(dtype=float),
             low=df["low"].to_numpy(dtype=float),
             close=df["close"].to_numpy(dtype=float),
-            bounds=_fold_bounds(len(df), num_folds),
+            bounds=_fold_bounds(is_n, num_folds),
+            oss1=(is_n, oss1_n),
+            oss2=(oss1_n, len(df)),
             instrument=instrument,
             initial_capital=capital,
-            years=len(df) / float(cfg.data.get("periods_per_year", 252)),
+            years=is_n / float(cfg.data.get("periods_per_year", 252)),
         ))
     if max_symbols:
         universe = universe[: int(max_symbols)]
@@ -299,14 +341,14 @@ def _cross_fold_consistency(sharpes: list[float]) -> float:
 
 
 def evaluate_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) -> SymbolResult:
-    """Walk-forward evaluation of one strategy on one symbol, search folds only."""
+    """Walk-forward evaluation of one strategy on one symbol over the IS folds only."""
     res = SymbolResult(symbol=sd.symbol, group=sd.group)
     try:
         if sigs is None:
             sigs = compute_signal_arrays(compiled, sd)
         settings = build_settings(cfg, sd.instrument, compiled, sd.initial_capital)
         metrics, extras = [], []
-        for a, b in sd.bounds[:-1]:
+        for a, b in sd.bounds:
             m, x = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year)
             metrics.append(m)
             extras.append(x)
@@ -325,7 +367,7 @@ def evaluate_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) 
     res.consistency = _cross_fold_consistency(sharpes)
     res.max_dd = float(min(m["max_drawdown"] for m in metrics))
     res.total_trades = int(sum(trades))
-    search_years = sum(b - a for a, b in sd.bounds[:-1]) / max(1, ev.periods_per_year)
+    search_years = sum(b - a for a, b in sd.bounds) / max(1, ev.periods_per_year)
     res.trades_per_year = res.total_trades / search_years if search_years else 0.0
     res.avg_hold = (sum(x["hold_sum"] for x in extras) / res.total_trades) if res.total_trades else 0.0
     res.long_pnl_pct = sum(x["long_pnl"] for x in extras) / (settings.initial_capital * len(extras)) * 100.0
@@ -348,7 +390,7 @@ def evaluate_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) 
     # min_trades_per_year*4 trades (floor: min_trades_per_fold). A strategy that
     # trades 2-5x a year is a handful of lucky positions, not a strategy.
     needed = [max(ev.min_trades_per_fold, int(round(ev.min_trades_per_year * (b - a) / max(1, ev.periods_per_year))))
-              for a, b in sd.bounds[:-1]]
+              for a, b in sd.bounds]
     if any(t < n for t, n in zip(trades, needed)):
         codes.append("low_trades")
     res.fail_codes = codes
@@ -356,14 +398,15 @@ def evaluate_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) 
     return res
 
 
-def holdout_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) -> dict:
-    """Evaluate the reserved final fold. Call only for strategies that already
-    passed the universe screen; never feed the output back into prompts."""
+def segment_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, segment: tuple[int, int], sigs=None) -> dict:
+    """Evaluate one strategy on one symbol over a single out-of-sample bar slice.
+    Signals come from the full history (indicators warm up on earlier data), exactly
+    as in the IS folds."""
     try:
         if sigs is None:
             sigs = compute_signal_arrays(compiled, sd)
         settings = build_settings(cfg, sd.instrument, compiled, sd.initial_capital)
-        a, b = sd.bounds[-1]
+        a, b = segment
         m, _ = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year)
         return {"symbol": sd.symbol, "group": sd.group, "sharpe": m["sharpe"], "trades": int(m["num_trades"]),
                 "max_dd": m["max_drawdown"], "total_return": m["total_return"]}
@@ -521,8 +564,7 @@ def evaluate_universe(compiled, universe: list[SymbolData], ev: EvalSettings, cf
                           seconds=time.monotonic() - started)
 
 
-def run_universe_holdout(compiled, universe: list[SymbolData], ev: EvalSettings, cfg) -> dict:
-    rows = [holdout_symbol(compiled, sd, ev, cfg) for sd in universe]
+def _segment_summary(rows: list[dict]) -> dict:
     sharpes = np.array([r["sharpe"] for r in rows]) if rows else np.array([0.0])
     return {
         "rows": rows,
@@ -530,3 +572,32 @@ def run_universe_holdout(compiled, universe: list[SymbolData], ev: EvalSettings,
         "mean_sharpe": round(float(np.mean(np.clip(sharpes, -1.5, 1.5))), 4),
         "pct_positive": round(float((sharpes > 0).mean()), 3),
     }
+
+
+def oss1_verdict(oss1: dict, accept_cfg: dict) -> tuple[bool, str]:
+    """The validation gate: does a strategy that cleared the IS screen also hold up on OSS1?"""
+    gate = accept_cfg.get("oss1", {}) or {}
+    min_pos = float(gate.get("min_pct_positive", 0.0))
+    min_sharpe = float(gate.get("min_mean_sharpe", -9.0))
+    problems = []
+    if oss1["pct_positive"] < min_pos:
+        problems.append(f"OSS1 profitable on {oss1['pct_positive']:.0%} of symbols < {min_pos:.0%}")
+    if oss1["mean_sharpe"] < min_sharpe:
+        problems.append(f"OSS1 mean Sharpe {oss1['mean_sharpe']:+.2f} < {min_sharpe:+.2f}")
+    return not problems, "; ".join(problems)
+
+
+def run_universe_oss1(compiled, universe: list[SymbolData], ev: EvalSettings, cfg, sig_cache: dict | None = None) -> dict:
+    """Validation segment for every symbol, plus the OSS1 gate verdict (`passed`, `fail`).
+    Used by the research loop for strategies that already cleared the IS screen. Its
+    numbers must not be fed back into prompts or the tuner's fitness."""
+    sig_cache = sig_cache or {}
+    out = _segment_summary([segment_symbol(compiled, sd, ev, cfg, sd.oss1, sigs=sig_cache.get(sd.symbol)) for sd in universe])
+    out["passed"], out["fail"] = oss1_verdict(out, (cfg.get("universe", {}) or {}).get("accept", {}) or {})
+    return out
+
+
+def run_universe_oss2(compiled, universe: list[SymbolData], ev: EvalSettings, cfg) -> dict:
+    """THE TEST SET. Called only by src.final_test (`python main.py final-test`), never by the
+    research loop: every look at OSS2 that informs a decision turns it into more validation data."""
+    return _segment_summary([segment_symbol(compiled, sd, ev, cfg, sd.oss2) for sd in universe])

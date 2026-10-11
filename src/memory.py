@@ -17,8 +17,9 @@ state.json:
 - `recent_names`: names already used (the prompt asks the model to avoid
   repeats; the orchestrator also forces unique names).
 
-The reserved holdout results are stored on leaderboard entries for YOUR
-reading but are never included in anything sent to the LLM.
+Scores in here are IS (training-segment) scores. The OSS1 (validation) results are
+stored on leaderboard entries for YOUR reading but are never included in anything
+sent to the LLM. OSS2 (test) results never enter the memory at all.
 """
 from __future__ import annotations
 
@@ -33,7 +34,9 @@ logger = get_logger("memory")
 
 DEFAULT_MEMORY_PATH = Path("results") / "memory" / "state.json"
 # v3: scores are frequency-adjusted (trades/yr gate); v2 leaderboards ranked rarely-trading lucky strategies on top.
-STATE_VERSION = 3
+# v4: scores come from the IS segment only (IS / OSS1 / OSS2 split). v3 strategies were tuned on data that is now
+# OSS1/OSS2, so keeping them would leak the validation and test periods into the search.
+STATE_VERSION = 4
 
 LEADERBOARD_SIZE = 40
 MAX_SIGNATURES = 20000
@@ -74,8 +77,9 @@ def load_memory(path: str | Path = DEFAULT_MEMORY_PATH) -> dict:
         logger.warning("Failed to load memory at %s (%s); starting fresh", path, exc)
         return _empty_state()
     if state.get("version") != STATE_VERSION:
-        # v1 scored one symbol with a different rubric; its numbers are not
-        # comparable to universe scores. Keep the file for reference, start clean.
+        # Older versions scored a different data window / rubric; their numbers are not
+        # comparable (and their strategies were tuned on what is now OSS1/OSS2).
+        # Keep the file for reference, start clean.
         backup = path.with_name(f"state_v{state.get('version', 1)}_backup.json")
         try:
             path.replace(backup)
@@ -176,7 +180,7 @@ def record_invalid(state: dict, problems: list[str]) -> None:
 
 
 def record_result(state: dict, *, spec: dict, summary: dict, run_id: str, iteration: int, signature: str,
-                  behavior: str | None, accepted: bool, holdout: dict | None = None) -> None:
+                  behavior: str | None, accepted: bool, oss1: dict | None = None) -> None:
     """Register one fully evaluated strategy. `spec` is StrategySpec.to_record()."""
     state["total_tried"] = state.get("total_tried", 0) + 1
     if accepted:
@@ -212,8 +216,8 @@ def record_result(state: dict, *, spec: dict, summary: dict, run_id: str, iterat
         "signature": signature,
         "evolved": 0,
     }
-    if holdout:  # for the human; never sent to the LLM
-        entry["holdout"] = {k: holdout[k] for k in ("median_sharpe", "mean_sharpe", "pct_positive") if k in holdout}
+    if oss1:  # validation result, for the human; never sent to the LLM
+        entry["oss1"] = {k: oss1[k] for k in ("median_sharpe", "mean_sharpe", "pct_positive", "passed") if k in oss1}
     if summary.get("score", -9) > 0 and not summary.get("probe_rejected"):
         board = state.setdefault("leaderboard", [])
         board.append(entry)

@@ -1,4 +1,8 @@
-"""Chart and Markdown report generation (matplotlib + pandas only)."""
+"""Chart and Markdown report generation (matplotlib + pandas only).
+
+`write_universe_report` is the live one (IS / OSS1 reporting for the universe pipeline).
+The older single-symbol helpers below (`generate_all_charts`, `write_markdown_report`) belong
+to the legacy pnl_viewer notebook flow and still use the old search-fold / holdout wording."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -254,13 +258,13 @@ def write_markdown_report(strategy, symbol: str, source_filename: str, timeframe
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def write_universe_report(strat_dir: Path, spec, compiled, result, holdout: dict, universe, accepted: bool = True) -> None:
-    """Per-symbol table (CSV), a search-vs-holdout bar chart and a short
-    Markdown report for a strategy that passed the universe screen."""
+def write_universe_report(strat_dir: Path, spec, compiled, result, oss1: dict, universe, accepted: bool = True) -> None:
+    """Per-symbol table (CSV), an IS-vs-OSS1 bar chart and a short Markdown report.
+    OSS2 (test) never appears here: it is only read by `main.py final-test`."""
     from src import insights  # local import: report.py is imported by older code paths without src.insights
 
     strat_dir = Path(strat_dir)
-    hold = {r["symbol"]: r for r in holdout.get("rows", [])}
+    hold = {r["symbol"]: r for r in oss1.get("rows", [])}
     rows = []
     for r in result.per_symbol:
         h = hold.get(r.symbol, {})
@@ -270,7 +274,7 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, holdout: dict
             "fold_sharpes": r.fold_sharpes, "fold_trades": r.fold_trades, "trades_per_year": round(r.trades_per_year, 2),
             "max_drawdown": round(r.max_dd, 4), "long_pnl_pct": round(r.long_pnl_pct, 2),
             "short_pnl_pct": round(r.short_pnl_pct, 2), "passed": r.passed, "fail_codes": ",".join(r.fail_codes),
-            "holdout_sharpe": round(h.get("sharpe", float("nan")), 4), "holdout_trades": h.get("trades"),
+            "oss1_sharpe": round(h.get("sharpe", float("nan")), 4), "oss1_trades": h.get("trades"),
         })
     df = pd.DataFrame(rows).sort_values("avg_fold_sharpe", ascending=False)
     df.to_csv(strat_dir / "per_symbol.csv", index=False)
@@ -279,8 +283,8 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, holdout: dict
         fig, ax = plt.subplots(figsize=(8, max(4, 0.17 * len(df))))
         y = np.arange(len(df))
         colors = ["#2a9d8f" if p else "#9aa5b1" for p in df["passed"]]
-        ax.barh(y, df["avg_fold_sharpe"], color=colors, label="search avg fold Sharpe (green = passes all criteria)")
-        ax.scatter(df["holdout_sharpe"], y, color="#e76f51", s=14, zorder=3, label="reserved holdout Sharpe")
+        ax.barh(y, df["avg_fold_sharpe"], color=colors, label="IS avg fold Sharpe (green = passes all criteria)")
+        ax.scatter(df["oss1_sharpe"], y, color="#e76f51", s=14, zorder=3, label="OSS1 (validation) Sharpe")
         ax.set_yticks(y)
         ax.set_yticklabels(df["symbol"], fontsize=6)
         ax.invert_yaxis()
@@ -295,20 +299,24 @@ def write_universe_report(strat_dir: Path, spec, compiled, result, holdout: dict
     lines = [
         f"# {spec.name}",
         "",
-        "**ACCEPTED by the universe screen.**" if accepted else
-        "**Top-ranked by search score but NOT accepted** (did not clear every `universe.accept` gate); saved for inspection.",
+        "**ACCEPTED**: cleared the IS universe screen and the OSS1 validation gate." if accepted else
+        "**Top-ranked but NOT accepted** (did not clear every `universe.accept` gate, IS or OSS1); saved for inspection.",
         "",
         f"*{spec.idea}* (family: {spec.family}{', parent: ' + spec.parent if spec.parent else ''})",
         "",
-        "## Universe result (search folds only)",
+        "## Universe result (IS walk-forward folds only)",
         insights.results_line(s),
         "",
         f"- Symbols evaluated: {s.get('n_eval')} | profitable: {s.get('pct_positive', 0):.0%} | pass all criteria: {s.get('n_pass')}",
         f"- Diagnosis: {insights.diagnose(s)}",
         "",
-        "## Reserved holdout (final fold of every symbol; never used for selection)",
-        f"- Median Sharpe: {holdout.get('median_sharpe'):+.2f} | mean (clipped to +-1.5): {holdout.get('mean_sharpe'):+.2f} "
-        f"| symbols profitable: {holdout.get('pct_positive', 0):.0%}",
+        "## OSS1 (validation segment; the search never optimises on it)",
+        f"- Median Sharpe: {oss1.get('median_sharpe'):+.2f} | mean (clipped to +-1.5): {oss1.get('mean_sharpe'):+.2f} "
+        f"| symbols profitable: {oss1.get('pct_positive', 0):.0%} | gate: "
+        + ("passed" if oss1.get("passed") else f"FAILED ({oss1.get('fail')})" if "passed" in oss1 else "n/a"),
+        "",
+        "## OSS2 (test segment)",
+        "Not evaluated. Run `python main.py final-test --file <strategy> --confirm` once, at the very end.",
         "",
         "## Parameters",
         f"`{spec.params}` | stop {compiled.stop_loss_pct} | target {compiled.take_profit_pct}",

@@ -1,4 +1,9 @@
-"""Multi-fold walk-forward evaluation for daily futures strategies.
+"""LEGACY single-symbol multi-fold evaluation (old JSON-DSL pipeline, pnl_viewer.ipynb).
+
+The live universe pipeline uses the IS / OSS1 / OSS2 split in src/universe.py instead; the
+"last fold = holdout" convention below applies to this module only.
+
+Multi-fold walk-forward evaluation for daily futures strategies.
 
 Replaces the earlier single in-sample/out-of-sample split (see
 ASSUMPTIONS.md #19-21, #26 for that history) with K time-ordered,
