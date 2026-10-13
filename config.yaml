@@ -40,6 +40,10 @@ run:
   # parents did on the validation period. 0 = no validation phase (IS-accepted strategies are
   # still validated for the acceptance gate).
   validate_top_k: 12
+  # Saved strategies must be genuinely different bets: a candidate whose daily positions
+  # (long/short/flat over all symbols) correlate more than this with an already-saved one is skipped.
+  # 1.0 = no filter. (The first 11 saved strategies of run 20261013 were all variants of one idea.)
+  max_position_correlation: 0.7
   random_seed: 42
 
 data:
@@ -145,6 +149,10 @@ universe:
   # series that go negative (cocoa, heating oil, RBOB, soy meal, gasoil...).
   max_nonpositive_frac: 0.0005
   max_big_move_frac: 0.003
+  # Any single daily move above this (100% = price doubles/halves in one bar) is a data error:
+  # @RP=13INC trades at ~0.95 except for six weeks at ~700 (Dec 2003), which alone made the
+  # average IS PnL of every strategy negative.
+  max_single_move: 1.0
   max_symbols: null
   # Quick pre-screen: evaluate this many group-diverse symbols first and stop
   # if the strategy is clearly bad there (saves most of the backtest time).
@@ -168,6 +176,7 @@ universe:
     oss1:
       min_pct_positive: 0.55  # share of symbols with positive Sharpe on OSS1
       min_mean_sharpe: 0.10   # mean (clipped to +-1.5) per-symbol Sharpe on OSS1
+      min_half_mean_sharpe: 0.0  # ...and the same mean must be >= this in EACH half of OSS1 (edge not in one half only)
 
 instruments:
   "@TY":
@@ -220,6 +229,15 @@ split:
   # OSS cannot be judged).
   min_is_bars: 1500
   min_oss_bars: 250
+
+scoring:
+  # Futures drift: a long-only strategy that is in the market 40% of the time earns ~sqrt(0.4) of the
+  # buy-and-hold Sharpe by luck. With beta_adjust, every Sharpe (IS folds, OSS1, OSS2) is reported minus that
+  # exposure-matched baseline (src/universe.py: exposure_baseline), so only timing skill / shorting
+  # skill counts. The measured buy-and-hold Sharpe of this universe was +0.19 (IS), +0.33 (OSS1), +0.02 (OSS2)
+  # and the 11 saved strategies scored +0.20 / +0.27 / -0.08: no edge beyond that drift.
+  # false = the old raw-Sharpe behaviour.
+  beta_adjust: true
 
 validation:
   # Walk-forward folds INSIDE the in-sample (IS) period only (OSS1/OSS2 are not folds).

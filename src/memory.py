@@ -38,7 +38,9 @@ DEFAULT_MEMORY_PATH = Path("results") / "memory" / "state.json"
 # v3: scores are frequency-adjusted (trades/yr gate); v2 leaderboards ranked rarely-trading lucky strategies on top.
 # v4: scores come from the IS segment only (IS / OSS1 / OSS2 split). v3 strategies were tuned on data that is now
 # OSS1/OSS2, so keeping them would leak the validation and test periods into the search.
-STATE_VERSION = 4
+# v5: scores are Sharpe minus the exposure-matched buy-and-hold baseline (scoring.beta_adjust), and the corrupt
+# @RP=13INC series is gone; v4 scores mostly measured long-only market drift.
+STATE_VERSION = 5
 
 LEADERBOARD_SIZE = 40
 MAX_SIGNATURES = 20000

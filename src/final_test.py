@@ -44,9 +44,12 @@ def read_ledger(path: Path) -> list[dict]:
     return out
 
 
-def log_look(path: Path, compiled, file: str, n_symbols: int, is_score, oss1: dict, oss2: dict) -> dict:
-    """Append one OSS2 look to the ledger."""
+def log_look(path: Path, compiled, file: str, n_symbols: int, is_score, oss1: dict, oss2: dict, cfg=None) -> dict:
+    """Append one OSS2 look to the ledger. `metric` says which Sharpe the numbers are: ledger entries
+    from before scoring.beta_adjust are raw Sharpe and are not comparable with the adjusted ones."""
+    adjusted = bool(((cfg or {}).get("scoring", {}) or {}).get("beta_adjust", False)) if cfg is not None else False
     entry = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "strategy": compiled.strategy_name, "signature": compiled.signature,
+             "metric": "excess_over_exposure_matched_buy_hold" if adjusted else "raw_sharpe",
              "file": str(file), "n_symbols": n_symbols, "is_score": is_score,
              "oss1_mean_sharpe": oss1["mean_sharpe"], "oss1_pct_positive": oss1["pct_positive"],
              "oss2_mean_sharpe": oss2["mean_sharpe"], "oss2_median_sharpe": oss2["median_sharpe"],
@@ -89,7 +92,7 @@ def run_final_stage(run, top: list[dict]) -> list[dict]:
             ok, why = oss1_verdict(oss2, accept_cfg)
             verdict = "holds up on the test set (clears the OSS1 bar)" if ok else f"BELOW the OSS1 bar: {why.replace('OSS1', 'OSS2')}"
             append_oss2(Path(t["dir"]), spec.name, oss2, verdict)
-            log_look(path, compiled, t["dir"], len(run.universe), t["score"], oss1, oss2)
+            log_look(path, compiled, t["dir"], len(run.universe), t["score"], oss1, oss2, cfg)
             row.update(oss2_mean_sharpe=oss2["mean_sharpe"], oss2_median_sharpe=oss2["median_sharpe"],
                        oss2_pct_positive=oss2["pct_positive"], verdict=verdict)
         rows.append(row)
@@ -159,4 +162,4 @@ def run_final_test(strategy_path: str, cfg, symbols: list[str] | None = None, co
     print(f"OSS1 mean (clipped) Sharpe {oss1['mean_sharpe']:+.2f} | median {oss1['median_sharpe']:+.2f} | {oss1['pct_positive']:.0%} profitable")
     print(f"OSS2 mean (clipped) Sharpe {oss2['mean_sharpe']:+.2f} | median {oss2['median_sharpe']:+.2f} | {oss2['pct_positive']:.0%} profitable")
 
-    return log_look(path, compiled, strategy_path, len(universe), s.get("score"), oss1, oss2)
+    return log_look(path, compiled, strategy_path, len(universe), s.get("score"), oss1, oss2, cfg)

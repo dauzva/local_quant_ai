@@ -767,3 +767,37 @@ instead of asking questions.
       prints the verdict against the same bar as the OSS1 gate. The verdict is advisory.
     - `run` / `tune` use the same generation loop (including validation) but never run the
       final stage.
+
+## Post-mortem of run 20261013 and the fixes (2026-10-13)
+
+33. **The 11 strategies saved by run `20261013_072057` had no edge beyond market drift.** OSS2 mean
+    Sharpe was -0.07 on average (best +0.01) after +0.2 (IS) / +0.27 (OSS1). `scripts/diagnose_run.py`
+    shows why: (a) every one is long-only (short PnL exactly 0.00; the local search drops losing short
+    legs), (b) buy-and-hold on the same universe scores +0.19 / +0.33 / +0.02 (IS / OSS1 / OSS2), i.e.
+    the strategies' Sharpe is the drift, which was strong in IS/OSS1 and gone in OSS2, (c) ten of the
+    eleven are the same "near rolling high" idea (position correlations 0.4-0.8), so they were one
+    observation, (d) rates went from +0.5 Sharpe to -0.7 in OSS2 (the 2022 bond crash hits a
+    long-near-highs rule), volatility futures are negative in every segment.
+34. **Corrupt series `@RP=13INC`** (price ~0.95 except ~700 between 2003-12-11 and 2004-01-16) made
+    the average IS PnL of every strategy negative (-21 % of capital in 2004 alone) while the clipped
+    Sharpe hid it. `universe.max_single_move: 1.0` now excludes a symbol with any one-bar move above
+    100 % (43 symbols remain). It was the only offender in the data.
+35. **`scoring.beta_adjust` (default on): Sharpe minus an exposure-matched buy-and-hold baseline.**
+    `universe.exposure_baseline`: with long exposure eL and short exposure eS (fractions of bars) and
+    buy-and-hold Sharpe S, random timing earns (eL - eS) / sqrt(eL + eS) * S. Applied to every fold,
+    to OSS1 and to OSS2 (`sharpe_raw` and `raw_sharpe` keep the unadjusted number). Re-scored this
+    way the 11 strategies are ~0 in IS (-0.01..+0.02) and OSS1 (-0.04..+0.07); only
+    `seed_efficiency_ratio_regime` is positive in all three segments (+0.125 / +0.066 / +0.028),
+    a small decaying effect. Consequences: the old walk-forward thresholds (`min_avg_fold_sharpe`
+    0.3, `min_score` 0.15) are now much harder to clear, so few strategies are *accepted*; ranking,
+    saving and validation still work (the top N is saved regardless). Memory `STATE_VERSION` -> 5
+    archives the old leaderboard (its scores were drift). The OSS2 ledger entries from before this
+    change are raw Sharpe; new entries carry `metric`.
+36. **OSS1 gate: both halves.** The mean (clipped) per-symbol Sharpe must be >=
+    `accept.oss1.min_half_mean_sharpe` (0.0) in each half of OSS1, so an edge that lives in one
+    2-year half no longer passes. Costs ~3 extra cheap simulations per symbol.
+37. **Diversity at the end of the run: `run.max_position_correlation` (0.7).** When the top N is
+    chosen, a candidate whose daily positions (+1/-1/0 over all symbols) correlate above this with an
+    already chosen strategy is skipped, whatever its family label (all of the 11 were labelled
+    "momentum"). Parent selection during the generations is still only body-distinct; the beta
+    adjustment is what stops the search from converging on one drift-harvesting idea.

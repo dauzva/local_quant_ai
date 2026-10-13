@@ -228,3 +228,15 @@ Everything lives in `config.yaml`: data paths, instrument metadata, backtest
 costs and sizing, walk-forward and acceptance thresholds, universe filters,
 LLM settings and the memory path. `ASSUMPTIONS.md` lists defaults chosen where
 the spec was ambiguous.
+
+### Scoring is relative to market drift
+
+With `scoring.beta_adjust: true` (default) every Sharpe is reported **minus what the same market
+exposure would earn by luck** (`universe.exposure_baseline`), because futures drift made a plain
+long-only rule look like an edge in IS/OSS1 and disappear in OSS2 (ASSUMPTIONS.md #33-37). The
+unadjusted number is kept as `raw_sharpe`. Diagnostics for a finished run:
+
+```bash
+.venv\Scripts\python.exe -I scripts/diagnose_run.py results/<run_id> --out diag.md   # by group / year / long vs short, vs buy-and-hold
+.venv\Scripts\python.exe -I scripts/rescore_run.py results/<run_id>                  # current scoring + position correlations
+```

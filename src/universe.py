@@ -121,6 +121,7 @@ class EvalSettings:
     max_fold_drawdown: float
     min_avg_profit_factor: float
     periods_per_year: int
+    beta_adjust: bool = False     # score = Sharpe minus what the same market exposure earns by luck (see exposure_baseline)
 
 
 def build_eval_settings(cfg) -> EvalSettings:
@@ -135,6 +136,7 @@ def build_eval_settings(cfg) -> EvalSettings:
         max_fold_drawdown=float(v.max_fold_drawdown),
         min_avg_profit_factor=float(v.min_avg_profit_factor),
         periods_per_year=int(cfg.data.get("periods_per_year", 252)),
+        beta_adjust=bool((cfg.get("scoring", {}) or {}).get("beta_adjust", False)),
     )
 
 
@@ -203,7 +205,14 @@ def _data_quality_problem(df: pd.DataFrame, ucfg) -> str | None:
         return f"{nonpos:.1%} of bars have non-positive prices (back-adjusted series)"
     with np.errstate(all="ignore"):
         moves = np.abs(np.diff(close) / close[:-1])
-    big = float((moves[np.isfinite(moves)] > 0.2).mean()) if len(moves) else 0.0
+    moves = moves[np.isfinite(moves)]
+    # A single bar that more than doubles/halves the price is a data error, not a market move
+    # (@RP=13INC jumps from 0.97 to 697 for six weeks around Dec 2003). One such bar is rare
+    # enough to slip under the fraction test below yet it dominates every PnL number.
+    max_move = float(ucfg.get("max_single_move", 1.0) or 0.0)
+    if max_move > 0 and len(moves) and float(moves.max()) > max_move:
+        return f"a single daily move of {float(moves.max()):.0%} (corrupt bar / contract mix-up)"
+    big = float((moves > 0.2).mean()) if len(moves) else 0.0
     if big > float(ucfg.get("max_big_move_frac", 0.003)):
         return f"{big:.1%} of daily moves exceed 20% (broken/adjusted series)"
     return None
@@ -312,7 +321,58 @@ def compute_signal_arrays(compiled, sd: SymbolData) -> tuple[np.ndarray, np.ndar
     return tuple(np.ascontiguousarray(s.to_numpy(dtype=bool)) for s in (le, lx, se, sx))
 
 
-def _run_fold(sd: SymbolData, sigs, settings: SimSettings, a: int, b: int, ppy: int) -> tuple[dict, dict]:
+def position_vector(compiled, universe: list[SymbolData], cfg, sig_cache: dict | None = None) -> np.ndarray:
+    """What a strategy actually DOES: +1 (long) / -1 (short) / 0 (flat) for every bar of every
+    symbol, concatenated. Two strategies whose vectors correlate highly are the same bet with
+    different parameters, whatever their code or family label says."""
+    parts = []
+    for sd in universe:
+        sigs = (sig_cache or {}).get(sd.symbol) or compute_signal_arrays(compiled, sd)
+        le, lx, se, sx = sigs
+        settings = build_settings(cfg, sd.instrument, compiled, sd.initial_capital)
+        _eq, nt, ent, ext, tdir, *_ = simulate_arrays(sd.open_, sd.high, sd.low, sd.close, le, lx, se, sx, settings)
+        pos = np.zeros(sd.n, dtype=np.float32)
+        for i in range(nt):
+            pos[ent[i]:ext[i]] = tdir[i]
+        parts.append(pos)
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+
+
+def position_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or a.size != b.size or a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def exposure_baseline(close: np.ndarray, t_entry: np.ndarray, t_exit: np.ndarray, t_dir: np.ndarray, ppy: int) -> float:
+    """Sharpe that the SAME market exposure would earn with no timing skill.
+
+    A long-only strategy that sits in the market a fraction f of the time earns, with random
+    timing, a mean of f*mu and a volatility of sqrt(f)*sigma, i.e. Sharpe = sqrt(f) * SharpeBuyHold.
+    With long exposure eL and short exposure eS (fractions of the bars) the general form is
+    (eL - eS) / sqrt(eL + eS) * SharpeBuyHold. Generated strategies were found to be ~all long-only
+    and to score exactly what that formula gives (they harvested the up-drift of futures markets
+    in the IS/OSS1 years, which was gone in OSS2), so a strategy is credited only for the part of
+    its Sharpe above this baseline."""
+    n = len(close)
+    if n < 3 or len(t_entry) == 0:
+        return 0.0
+    held = np.clip(t_exit - t_entry, 0, None)
+    e_long = float(held[t_dir == 1].sum()) / n
+    e_short = float(held[t_dir == -1].sum()) / n
+    if e_long + e_short <= 0:
+        return 0.0
+    with np.errstate(all="ignore"):
+        rets = np.diff(close) / close[:-1]
+    rets = rets[np.isfinite(rets)]
+    if rets.size < 2 or rets.std() <= 0:
+        return 0.0
+    sharpe_bh = float(rets.mean() / rets.std() * np.sqrt(ppy))
+    return (e_long - e_short) / np.sqrt(e_long + e_short) * sharpe_bh
+
+
+def _run_fold(sd: SymbolData, sigs, settings: SimSettings, a: int, b: int, ppy: int,
+              beta_adjust: bool = False) -> tuple[dict, dict]:
     le, lx, se, sx = sigs
     equity, nt, _ent, t_exit, t_dir, _con, _epx, _xpx, t_pnl, _cost, _rsn = simulate_arrays(
         sd.open_[a:b], sd.high[a:b], sd.low[a:b], sd.close[a:b],
@@ -320,6 +380,10 @@ def _run_fold(sd: SymbolData, sigs, settings: SimSettings, a: int, b: int, ppy: 
     )
     pnl = t_pnl[:nt]
     m = fast_metrics(equity, pnl, ppy)
+    m["sharpe_raw"] = m["sharpe"]
+    m["baseline"] = exposure_baseline(sd.close[a:b], _ent[:nt], t_exit[:nt], t_dir[:nt], ppy)
+    if beta_adjust:
+        m["sharpe"] = m["sharpe_raw"] - m["baseline"]
     direction = t_dir[:nt]
     extra = {
         "long_pnl": float(pnl[direction == 1].sum()),
@@ -349,7 +413,7 @@ def evaluate_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, sigs=None) 
         settings = build_settings(cfg, sd.instrument, compiled, sd.initial_capital)
         metrics, extras = [], []
         for a, b in sd.bounds:
-            m, x = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year)
+            m, x = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year, ev.beta_adjust)
             metrics.append(m)
             extras.append(x)
     except Exception as exc:
@@ -407,9 +471,14 @@ def segment_symbol(compiled, sd: SymbolData, ev: EvalSettings, cfg, segment: tup
             sigs = compute_signal_arrays(compiled, sd)
         settings = build_settings(cfg, sd.instrument, compiled, sd.initial_capital)
         a, b = segment
-        m, _ = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year)
-        return {"symbol": sd.symbol, "group": sd.group, "sharpe": m["sharpe"], "trades": int(m["num_trades"]),
-                "max_dd": m["max_drawdown"], "total_return": m["total_return"]}
+        m, _ = _run_fold(sd, sigs, settings, a, b, ev.periods_per_year, ev.beta_adjust)
+        out = {"symbol": sd.symbol, "group": sd.group, "sharpe": m["sharpe"], "raw_sharpe": m["sharpe_raw"],
+               "trades": int(m["num_trades"]), "max_dd": m["max_drawdown"], "total_return": m["total_return"]}
+        mid = (a + b) // 2
+        if mid - a >= 120 and b - mid >= 120:        # two halves: an edge should not live in only one of them
+            out["sharpe_h1"] = _run_fold(sd, sigs, settings, a, mid, ev.periods_per_year, ev.beta_adjust)[0]["sharpe"]
+            out["sharpe_h2"] = _run_fold(sd, sigs, settings, mid, b, ev.periods_per_year, ev.beta_adjust)[0]["sharpe"]
+        return out
     except Exception as exc:
         return {"symbol": sd.symbol, "group": sd.group, "sharpe": 0.0, "trades": 0, "max_dd": 0.0,
                 "total_return": 0.0, "error": str(exc)}
@@ -566,12 +635,20 @@ def evaluate_universe(compiled, universe: list[SymbolData], ev: EvalSettings, cf
 
 def _segment_summary(rows: list[dict]) -> dict:
     sharpes = np.array([r["sharpe"] for r in rows]) if rows else np.array([0.0])
-    return {
+    out = {
         "rows": rows,
         "median_sharpe": round(float(np.median(sharpes)), 4),
         "mean_sharpe": round(float(np.mean(np.clip(sharpes, -1.5, 1.5))), 4),
         "pct_positive": round(float((sharpes > 0).mean()), 3),
     }
+    raw = [r["raw_sharpe"] for r in rows if "raw_sharpe" in r]
+    if raw:
+        out["raw_mean_sharpe"] = round(float(np.mean(np.clip(raw, -1.5, 1.5))), 4)
+    for half in ("h1", "h2"):
+        vals = [r[f"sharpe_{half}"] for r in rows if f"sharpe_{half}" in r]
+        if vals:
+            out[f"mean_sharpe_{half}"] = round(float(np.mean(np.clip(vals, -1.5, 1.5))), 4)
+    return out
 
 
 def oss1_verdict(oss1: dict, accept_cfg: dict) -> tuple[bool, str]:
@@ -579,7 +656,12 @@ def oss1_verdict(oss1: dict, accept_cfg: dict) -> tuple[bool, str]:
     gate = accept_cfg.get("oss1", {}) or {}
     min_pos = float(gate.get("min_pct_positive", 0.0))
     min_sharpe = float(gate.get("min_mean_sharpe", -9.0))
+    min_half = gate.get("min_half_mean_sharpe")
     problems = []
+    if min_half is not None and "mean_sharpe_h1" in oss1 and "mean_sharpe_h2" in oss1:
+        worst = min(oss1["mean_sharpe_h1"], oss1["mean_sharpe_h2"])
+        if worst < float(min_half):
+            problems.append(f"OSS1 half-period mean Sharpe {worst:+.2f} < {float(min_half):+.2f} (edge lives in one half only)")
     if oss1["pct_positive"] < min_pos:
         problems.append(f"OSS1 profitable on {oss1['pct_positive']:.0%} of symbols < {min_pos:.0%}")
     if oss1["mean_sharpe"] < min_sharpe:

@@ -581,3 +581,81 @@ def test_pipeline_command_skips_oss2_with_flag_and_is_registered(cfg, tmp_path, 
     monkeypatch.setattr("src.orchestrator.run_research_loop", lambda cfg_, **kw: seen.update(kw) or "rid")
     M.cmd_pipeline(args, cfg)
     assert seen["final_test"] is False and seen["offline"] is True and seen["iterations"] == 3
+
+
+def test_single_corrupt_bar_excludes_a_symbol():
+    """@RP=13INC sat at ~0.95 except for six weeks at ~700: two crazy moves are too few for the
+    fraction test, but the PnL they cause dominated every strategy's IS result."""
+    from src import universe as U
+    px = np.full(3000, 0.95) + np.random.default_rng(0).normal(0, 0.002, 3000)
+    ok = pd.DataFrame({"open": px, "high": px, "low": px, "close": px})
+    assert U._data_quality_problem(ok, {}) is None
+    bad = ok.copy()
+    bad.loc[1000:1030, ["open", "high", "low", "close"]] = 700.0
+    assert "single daily move" in U._data_quality_problem(bad, {})
+    assert U._data_quality_problem(bad, {"max_single_move": 0}) is None          # switch-off works
+
+
+def test_exposure_baseline_is_what_luck_earns_for_the_same_exposure():
+    from src import universe as U
+    rng = np.random.default_rng(1)
+    close = 100 * np.cumprod(1 + rng.normal(0.0008, 0.01, 1000))
+    rets = np.diff(close) / close[:-1]
+    sh_bh = rets.mean() / rets.std() * np.sqrt(252)
+    ent, ext = np.array([0]), np.array([999])
+    long_all = U.exposure_baseline(close, ent, ext, np.array([1]), 252)
+    short_all = U.exposure_baseline(close, ent, ext, np.array([-1]), 252)
+    half = U.exposure_baseline(close, np.array([0]), np.array([500]), np.array([1]), 252)
+    assert long_all == pytest.approx(sh_bh * 999 / 1000 / np.sqrt(999 / 1000), rel=1e-9)
+    assert short_all == pytest.approx(-long_all)                                  # short earns minus the drift
+    assert half == pytest.approx(np.sqrt(500 / 1000) * sh_bh, rel=1e-9)         # f=0.5 long-only -> sqrt(f) * Sharpe(B&H)
+    assert U.exposure_baseline(close, np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int), 252) == 0.0
+
+
+def test_beta_adjust_removes_the_long_only_drift(cfg):
+    """A trivial 'be long' strategy must score ~0 once the drift is subtracted, and its raw Sharpe must still be reported."""
+    import dataclasses
+    from src import universe as U
+    cfg.universe.max_symbols = 3
+    cfg.backtest.stop_loss_pct_default = 0.0
+    cfg.backtest.take_profit_pct_default = 0.0
+    comp = compile_strategy(build_source(parse_specs("""===S===
+name: always long
+family: trend
+idea: be long
+sl: none
+tp: none
+params: {"n": 2}
+```python
+le = close > sma(close, 2) * 0 
+lx = close < 0
+```
+""")[0]))
+    cfg.scoring.beta_adjust = True
+    ev_adj = U.build_eval_settings(cfg)
+    cfg.scoring.beta_adjust = False
+    ev_raw = U.build_eval_settings(cfg)
+    assert ev_adj.beta_adjust and not ev_raw.beta_adjust
+    for sd in U.load_universe(cfg):
+        raw = U.segment_symbol(comp, sd, ev_raw, cfg, sd.oss1)
+        adj = U.segment_symbol(comp, sd, ev_adj, cfg, sd.oss1)
+        assert adj["raw_sharpe"] == pytest.approx(raw["sharpe"])
+        assert abs(adj["sharpe"]) < max(0.35, 0.5 * abs(raw["sharpe"]))        # most of the raw Sharpe was just drift
+
+
+def test_oss1_gate_requires_both_halves():
+    from src import universe as U
+    acc = {"oss1": {"min_pct_positive": 0.55, "min_mean_sharpe": 0.1, "min_half_mean_sharpe": 0.0}}
+    good = {"pct_positive": 0.7, "mean_sharpe": 0.3, "mean_sharpe_h1": 0.2, "mean_sharpe_h2": 0.4}
+    assert U.oss1_verdict(good, acc)[0]
+    ok, why = U.oss1_verdict({**good, "mean_sharpe_h1": -0.1}, acc)
+    assert not ok and "half" in why
+    assert U.oss1_verdict({"pct_positive": 0.7, "mean_sharpe": 0.3}, acc)[0]        # halves unavailable -> not a reason to fail
+
+
+def test_position_correlation():
+    from src import universe as U
+    a = np.array([1, 1, 0, 0, -1, 1], dtype=np.float32)
+    assert U.position_correlation(a, a) == pytest.approx(1.0)
+    assert U.position_correlation(a, np.zeros_like(a)) == 0.0
+    assert U.position_correlation(a, -a) == pytest.approx(-1.0)

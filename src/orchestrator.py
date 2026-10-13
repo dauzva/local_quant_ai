@@ -51,7 +51,7 @@ from src.strategy_codegen import (StrategySpec, build_evolve_prompt, build_explo
                                   friendly_problem, parse_specs)
 from src.strategy_sandbox import CompiledStrategy, StrategySandboxError, compile_strategy
 from src.universe import (SymbolData, UniverseResult, behavior_signature, build_eval_settings, evaluate_universe,
-                          load_universe, pick_probe, run_universe_oss1)
+                          load_universe, pick_probe, position_correlation, position_vector, run_universe_oss1)
 from src.utils import get_logger, new_run_id, safe_strategy_dirname, strategy_filename
 
 logger = get_logger("orchestrator")
@@ -386,8 +386,24 @@ class Run:
                 self.oss1_of[spec.name] = run_universe_oss1(compiled, self.universe, self.ev, self.cfg)
         shortlist.sort(key=lambda t: -self.oss1_of[t[0].name]["mean_sharpe"])
 
+        # Diversity: skip a candidate whose positions track an already-chosen strategy (same bet,
+        # different parameters). Ten near-identical long-only breakouts are one data point.
+        max_corr = float(self.cfg.run.get("max_position_correlation", 1.0) or 1.0)
+        chosen, vectors = [], []
+        for item in shortlist:
+            if len(chosen) >= n:
+                break
+            if max_corr < 1.0:
+                vec = position_vector(item[1], self.universe, self.cfg)
+                twin = next((c[0].name for c, w in zip(chosen, vectors) if position_correlation(vec, w) > max_corr), None)
+                if twin:
+                    logger.info("Not saving '%s': its positions correlate > %.2f with '%s'", item[0].name, max_corr, twin)
+                    continue
+                vectors.append(vec)
+            chosen.append(item)
+
         out = []
-        for spec, compiled, result, model in shortlist[:n]:
+        for spec, compiled, result, model in chosen:
             oss1 = self.oss1_of[spec.name]
             d = self.dir / "strategies" / safe_strategy_dirname(spec.name)
             if not d.exists():
